@@ -13,7 +13,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Pin the hosted compatibility lane. The floating Windows alias maps
+        # to a Server 2025 / VS2026 preview image where the reviewed unsigned
+        # Dreamina Go binary is held indefinitely before main. Native Windows
+        # 11 remains the separate fresh-user hard Gate in RELEASE.md.
+        os: [ubuntu-latest, macos-latest, windows-2022]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

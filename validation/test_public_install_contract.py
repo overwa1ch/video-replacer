@@ -138,13 +138,14 @@ class PublicInstallContractTests(unittest.TestCase):
             encoding="utf-8"
         )
         for phrase in (
-            "windows-latest",
+            "windows-2022",
             ".\\install.cmd --with-mosaic",
             ".\\video-replacer.cmd status --json",
             ".\\video-replacer-test.cmd",
             ".\\tools\\install_dreamina.py",
         ):
             self.assertIn(phrase, workflow)
+        self.assertNotIn("windows-latest", workflow)
         self.assertNotIn(".\\.video-replacer\\bin\\dreamina.exe version", workflow)
 
     def test_windows_release_label_has_a_real_machine_hard_gate(self) -> None:
