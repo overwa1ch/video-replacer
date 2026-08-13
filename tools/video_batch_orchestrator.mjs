@@ -518,6 +518,27 @@ export async function runJobPipeline(jobs, controls) {
   return settled.map((item) => item.value);
 }
 
+function paymentCheckpointAuthorizer(options, batch, flow) {
+  let profileManagedPromise = null;
+  let sharedLegacyCheckpoint = null;
+  return async (jobId) => {
+    profileManagedPromise ??= batchUsesBackendProfile(batch);
+    if (await profileManagedPromise) {
+      // Profile-managed approvals bind each Job's final media and therefore
+      // use separate checkpoint paths.
+      return writePaymentCheckpoint(options, batch, flow, { jobIds: [jobId] });
+    }
+    // Frozen legacy flows use one batch-wide approval.  Every concurrent Job
+    // must await the same atomic write: rewriting that shared file while an
+    // earlier worker is reading it is rejected by Windows file sharing and is
+    // unnecessary because the capability, PID, flow and scope are identical.
+    sharedLegacyCheckpoint ??= writePaymentCheckpoint(options, batch, flow, {
+      jobIds: [jobId],
+    });
+    return sharedLegacyCheckpoint;
+  };
+}
+
 export function paymentAuthorizationBinding(token, payload) {
   const values = [
     "video-loop-payment-v1",
@@ -853,6 +874,7 @@ export async function runStreamingBatch(options, batch, { preparationOnly = fals
   const scoped = { ...options, batch, preparationOnly };
   const flow = await runWorkerJson(scoped, "inspect-flow");
   const jobs = Array.isArray(flow.jobs) ? flow.jobs : [];
+  const authorizeJob = paymentCheckpointAuthorizer(scoped, batch, flow);
   const results = await runJobPipeline(jobs, {
     preparationConcurrency: options.preparationConcurrency,
     generationConcurrency: options.generationConcurrency,
@@ -861,7 +883,7 @@ export async function runStreamingBatch(options, batch, { preparationOnly = fals
     prepareJob: (job) =>
       runWorkerJson({ ...scoped, jobId: job.id }, "prepare-job"),
     submitJob: async (job) => {
-      await writePaymentCheckpoint(scoped, batch, flow, { jobIds: [job.id] });
+      await authorizeJob(job.id);
       return runWorkerJson({ ...scoped, jobId: job.id }, "submit-job");
     },
   });
@@ -893,6 +915,7 @@ export async function runPreparedStreamingBatch(options, batch) {
     preparations.map((preparation, index) => [jobs[index].id, preparation]),
   );
   await runWorkerJson(scoped, "preflight-submission");
+  const authorizeJob = paymentCheckpointAuthorizer(scoped, batch, flow);
   const results = await runJobPipeline(jobs, {
     preparationConcurrency: options.preparationConcurrency,
     generationConcurrency: options.generationConcurrency,
@@ -900,7 +923,7 @@ export async function runPreparedStreamingBatch(options, batch) {
     allowSubmission: true,
     prepareJob: (job) => preparationByJob.get(job.id),
     submitJob: async (job) => {
-      await writePaymentCheckpoint(scoped, batch, flow, { jobIds: [job.id] });
+      await authorizeJob(job.id);
       return runWorkerJson({ ...scoped, jobId: job.id }, "submit-job");
     },
   });
