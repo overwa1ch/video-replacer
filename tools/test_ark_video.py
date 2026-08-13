@@ -145,6 +145,10 @@ class ArkVideoSafetyTests(unittest.TestCase):
         self.assertNotIn(raw_key, json.dumps(marker, ensure_ascii=False))
         self.assertEqual(marker["task_id"], "task-1")
 
+    @unittest.skipIf(
+        os.name == "nt",
+        "POSIX mode bits do not express the native Windows DACL contract",
+    )
     def test_external_record_is_owner_only(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "record.json"

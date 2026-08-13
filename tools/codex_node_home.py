@@ -736,17 +736,26 @@ def _file_identity(metadata: os.stat_result) -> tuple[int, int]:
     return (metadata.st_dev, metadata.st_ino)
 
 
-def _file_content_identity(metadata: os.stat_result) -> tuple[int, ...]:
+def _handle_file_content_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    """Return fields that are directly comparable across one open handle."""
+
     return (
         metadata.st_mode,
         metadata.st_size,
         metadata.st_mtime_ns,
         metadata.st_ctime_ns,
+        getattr(metadata, "st_file_attributes", 0),
     )
 
 
 def _read_stable_file_auth(auth_path: Path) -> bytes:
-    """Read one bounded regular file and detect replacement or mutation."""
+    """Read one bounded regular file and detect replacement or mutation.
+
+    Both the content read and the final pathname check use handle-based
+    metadata.  On Windows, CPython deliberately exposes different ctime and
+    mode semantics through path ``stat()`` and handle ``fstat()``; comparing
+    two handles preserves ChangeTime checks without accepting that mismatch.
+    """
 
     auth = Path(auth_path)
     if is_link_like(auth):
@@ -755,27 +764,33 @@ def _read_stable_file_auth(auth_path: Path) -> bytes:
     flags |= getattr(os, "O_BINARY", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     descriptor: Optional[int] = None
+    path_descriptor: Optional[int] = None
     try:
         descriptor = os.open(str(auth), flags)
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode):
             raise OSError
-        with os.fdopen(descriptor, "rb", closefd=True) as handle:
-            descriptor = None
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
             raw = handle.read(MAX_AUTH_FILE_BYTES + 1)
             after = os.fstat(handle.fileno())
-        path_after = os.stat(auth, follow_symlinks=False)
+        path_descriptor = os.open(str(auth), flags)
+        path_after = os.fstat(path_descriptor)
     except OSError:
+        raise CodexNodeHomeError(_AUTH_SCHEMA_ERROR) from None
+    finally:
+        if path_descriptor is not None:
+            os.close(path_descriptor)
         if descriptor is not None:
             os.close(descriptor)
-        raise CodexNodeHomeError(_AUTH_SCHEMA_ERROR) from None
     if (
         is_link_like(auth)
         or not stat.S_ISREG(path_after.st_mode)
         or _file_identity(before) != _file_identity(after)
         or _file_identity(after) != _file_identity(path_after)
-        or _file_content_identity(before) != _file_content_identity(after)
-        or _file_content_identity(after) != _file_content_identity(path_after)
+        or _handle_file_content_identity(before)
+        != _handle_file_content_identity(after)
+        or _handle_file_content_identity(after)
+        != _handle_file_content_identity(path_after)
         or after.st_size != len(raw)
     ):
         raise CodexNodeHomeError(_AUTH_SCHEMA_ERROR)

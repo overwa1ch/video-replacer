@@ -10,6 +10,17 @@ from tools import dreamina_environment
 
 
 class DreaminaEnvironmentTests(unittest.TestCase):
+    @staticmethod
+    def _native_windows_directories():
+        return mock.patch.object(
+            dreamina_environment,
+            "_windows_api_directory",
+            side_effect=lambda function_name: {
+                "GetWindowsDirectoryW": "C:\\Windows",
+                "GetSystemDirectoryW": "C:\\Windows\\System32",
+            }[function_name],
+        )
+
     def test_posix_environment_is_credential_minimized(self) -> None:
         result = dreamina_environment.dreamina_environment(
             {
@@ -37,7 +48,7 @@ class DreaminaEnvironmentTests(unittest.TestCase):
                 "C:\\Program Files\\PowerShell\\7;C:\\custom"
             ),
         }
-        with mock.patch.object(
+        with self._native_windows_directories(), mock.patch.object(
             dreamina_environment.shutil, "which", return_value=None
         ) as which:
             result = dreamina_environment.dreamina_environment(source, windows=True)
@@ -55,20 +66,23 @@ class DreaminaEnvironmentTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(
                 dreamina_environment.DreaminaEnvironmentError
             ):
-                dreamina_environment.dreamina_environment(
-                    {"USERPROFILE": "C:\\Users\\example", "SYSTEMROOT": value},
-                    windows=True,
+                dreamina_environment._validated_windows_directory(
+                    value, label="SYSTEMROOT"
                 )
+
+    def test_windows_rejects_disagreeing_native_system_directories(self) -> None:
         with self.assertRaisesRegex(
-            dreamina_environment.DreaminaEnvironmentError, "disagree"
+            dreamina_environment.DreaminaEnvironmentError,
+            "directories disagree",
+        ), mock.patch.object(
+            dreamina_environment.os, "name", "nt"
+        ), mock.patch.object(
+            dreamina_environment,
+            "_windows_api_directory",
+            side_effect=("C:\\Windows", "D:\\Windows\\System32"),
         ):
-            dreamina_environment.dreamina_environment(
-                {
-                    "USERPROFILE": "C:\\Users\\example",
-                    "SYSTEMROOT": "C:\\Windows",
-                    "WINDIR": "D:\\Windows",
-                },
-                windows=True,
+            dreamina_environment._windows_directories(
+                {"SYSTEMROOT": "C:\\ignored", "WINDIR": "D:\\ignored"}
             )
 
     def test_windows_fails_if_a_shell_remains_resolvable(self) -> None:

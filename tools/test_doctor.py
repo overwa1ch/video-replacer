@@ -73,7 +73,7 @@ class DoctorTests(unittest.TestCase):
     def test_stable_file_auth_home_is_used_for_login_and_model_checks(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
-            binary = root / "codex"
+            binary = root / ("codex.exe" if doctor.os.name == "nt" else "codex")
             binary.write_bytes(b"fixture")
             node_home = root / "codex-node-home"
             node_home.mkdir()
@@ -118,6 +118,10 @@ class DoctorTests(unittest.TestCase):
                 ),
             ]
             with mock.patch.object(doctor, "codex_path", return_value=binary), mock.patch.object(
+                doctor,
+                "verify_windows_codex",
+                return_value={"binary": str(binary)},
+            ), mock.patch.object(
                 doctor, "codex_home_path", return_value=node_home
             ), mock.patch.object(
                 doctor, "validate_node_home", return_value=node_home
@@ -141,7 +145,7 @@ class DoctorTests(unittest.TestCase):
     def test_codex_below_prompt_node_minimum_fails_ready(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
-            binary = root / "codex"
+            binary = root / ("codex.exe" if doctor.os.name == "nt" else "codex")
             binary.write_bytes(b"fixture")
             results = [
                 mock.Mock(returncode=0, stdout="codex-cli 0.146.9"),
@@ -153,6 +157,10 @@ class DoctorTests(unittest.TestCase):
             node_home = root / "codex-node-home"
             node_home.mkdir()
             with mock.patch.object(doctor, "codex_path", return_value=binary), mock.patch.object(
+                doctor,
+                "verify_windows_codex",
+                return_value={"binary": str(binary)},
+            ), mock.patch.object(
                 doctor, "codex_home_path", return_value=node_home
             ), mock.patch.object(
                 doctor, "validate_node_home", return_value=node_home
@@ -174,7 +182,7 @@ class DoctorTests(unittest.TestCase):
     def test_file_auth_wire_failure_is_a_distinct_required_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            binary = root / "codex"
+            binary = root / ("codex.exe" if doctor.os.name == "nt" else "codex")
             binary.write_bytes(b"fixture")
             node_home = root / "codex-node-home"
             node_home.mkdir()
@@ -203,6 +211,10 @@ class DoctorTests(unittest.TestCase):
             ]
             with mock.patch.object(
                 doctor, "codex_path", return_value=binary
+            ), mock.patch.object(
+                doctor,
+                "verify_windows_codex",
+                return_value={"binary": str(binary)},
             ), mock.patch.object(
                 doctor, "codex_home_path", return_value=node_home
             ), mock.patch.object(

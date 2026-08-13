@@ -69,11 +69,27 @@ class SetupTests(unittest.TestCase):
         def fake_identity(name, path_text, runtime_paths):
             path = Path(path_text)
             metadata = path.stat()
-            return {
+            identity = {
                 "resolved_path": str(path.resolve()),
                 "size": metadata.st_size,
                 "mtime_ns": metadata.st_mtime_ns,
                 "version": self.tool_versions[name],
+            }
+            if name == "codex" and os.name == "nt":
+                identity.update(
+                    {
+                        "official_sha256": "c" * 64,
+                        "official_release_tag": "rust-v0.147.0",
+                    }
+                )
+            return identity
+
+        def verified_windows_codex(binary):
+            return {
+                "binary": str(Path(binary)),
+                "version": "0.147.0",
+                "sha256": "c" * 64,
+                "release": {"tag_name": "rust-v0.147.0"},
             }
 
         self.tool_identity_patcher = mock.patch.object(
@@ -93,6 +109,11 @@ class SetupTests(unittest.TestCase):
                 setup,
                 "verified_dreamina_artifact",
                 return_value={"url": "https://official.example/dreamina", "sha256": "f" * 64},
+            ),
+            mock.patch.object(
+                setup,
+                "verify_windows_codex",
+                side_effect=verified_windows_codex,
             ),
             mock.patch.object(setup.doctor, "inside", return_value=False),
             mock.patch.object(setup.doctor, "temporary_path", return_value=False),

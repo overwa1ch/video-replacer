@@ -119,6 +119,31 @@ class CodexNodeHomeTests(unittest.TestCase):
             hashlib.sha256(FIXTURE_ACCESS_TOKEN.encode("utf-8")).digest(),
         )
 
+    def test_file_auth_handle_identity_retains_mutation_guards(self) -> None:
+        common = {
+            "st_dev": 1,
+            "st_ino": 2,
+            "st_size": 3,
+            "st_mtime_ns": 4,
+            "st_file_attributes": 32,
+        }
+        handle = types.SimpleNamespace(
+            **common, st_mode=0o100600, st_ctime_ns=6
+        )
+        for field in (
+            "st_mode",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+            "st_file_attributes",
+        ):
+            changed = types.SimpleNamespace(**{**vars(handle), field: 99})
+            with self.subTest(field=field):
+                self.assertNotEqual(
+                    node_home._handle_file_content_identity(handle),
+                    node_home._handle_file_content_identity(changed),
+                )
+
     @unittest.skipIf(os.name == "nt", "open-file replacement semantics differ on Windows")
     def test_file_auth_digest_rejects_path_swap_during_read(self) -> None:
         home = self._home()
