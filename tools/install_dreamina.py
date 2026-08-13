@@ -27,6 +27,7 @@ MANIFEST_PATH = Path(__file__).with_name("dreamina-install-manifest.json")
 INSTALL_ROOT = REPO_ROOT / ".video-replacer" / "bin"
 TARGET_PATH = INSTALL_ROOT / ("dreamina.exe" if os.name == "nt" else "dreamina")
 MAX_DOWNLOAD_BYTES = 256 * 1024 * 1024
+VERSION_CHECK_TIMEOUT_SECONDS = 120 if os.name == "nt" else 30
 
 
 class InstallError(RuntimeError):
@@ -217,13 +218,17 @@ def install(*, opener=urllib.request.urlopen) -> Dict[str, object]:
             candidate.chmod(0o700)
         completed = subprocess.run(
             [str(candidate), "version"],
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             encoding="utf-8",
             errors="replace",
             check=False,
-            timeout=30,
+            # Windows may cold-scan a newly downloaded 32 MiB executable
+            # before CreateProcess returns. Keep the check bounded while
+            # allowing that first-launch security scan to finish.
+            timeout=VERSION_CHECK_TIMEOUT_SECONDS,
             env=safe_environment(),
         )
         if completed.returncode != 0:

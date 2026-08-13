@@ -83,7 +83,9 @@ class DreaminaInstallerTests(unittest.TestCase):
                 installer,
                 "artifact_for",
                 return_value={"url": "https://official.example/dreamina", "sha256": digest},
-            ), mock.patch.object(installer.subprocess, "run", return_value=completed):
+            ), mock.patch.object(
+                installer.subprocess, "run", return_value=completed
+            ) as run:
                 report = installer.install(opener=opener)
 
             self.assertEqual(target.read_bytes(), payload)
@@ -91,6 +93,12 @@ class DreaminaInstallerTests(unittest.TestCase):
             self.assertEqual(report["binary_version"], "a857341-dirty (a857341)")
             self.assertFalse(report["modified_shell"])
             self.assertFalse(report["installed_global_skill"])
+            command = run.call_args
+            self.assertEqual(command.args[0][1], "version")
+            self.assertIs(command.kwargs["stdin"], installer.subprocess.DEVNULL)
+            self.assertEqual(
+                command.kwargs["timeout"], installer.VERSION_CHECK_TIMEOUT_SECONDS
+            )
             if os.name != "nt":
                 self.assertEqual(target.stat().st_mode & 0o777, 0o700)
 
