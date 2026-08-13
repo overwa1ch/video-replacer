@@ -456,6 +456,8 @@ def _read_stable_file(path: Path, maximum_bytes: int) -> bytes:
         _stable_identity(before) == _stable_identity(opened_before)
         == _stable_identity(opened_after)
         == _stable_identity(after)
+        and before.st_mode == after.st_mode
+        and opened_before.st_mode == opened_after.st_mode
     ):
         raise CodexArtifactError(f"Codex package file changed during verification: {path}")
     return raw
@@ -478,6 +480,8 @@ def _sha256_stable_file(path: Path) -> str:
         _stable_identity(before) == _stable_identity(opened_before)
         == _stable_identity(opened_after)
         == _stable_identity(after)
+        and before.st_mode == after.st_mode
+        and opened_before.st_mode == opened_after.st_mode
     ):
         raise CodexArtifactError("Codex executable changed during verification")
     return digest.hexdigest()
@@ -487,7 +491,11 @@ def _stable_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int,
     return (
         metadata.st_dev,
         metadata.st_ino,
-        metadata.st_mode,
+        # CPython's Windows path-stat layer infers 0111 from an .exe suffix,
+        # while fstat() has no pathname and reports the same regular file
+        # without those derived permission bits.  File type remains part of
+        # the identity; extension-derived permissions do not.
+        stat.S_IFMT(metadata.st_mode),
         metadata.st_size,
         metadata.st_mtime_ns,
         getattr(metadata, "st_file_attributes", 0),

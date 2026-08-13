@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -122,6 +123,37 @@ class WindowsCodexArtifactTests(unittest.TestCase):
                 "https://releases.openai.com/codex/releases/"
                 f"{self.VERSION}/release.json"
             ],
+        )
+
+    def test_stable_identity_ignores_only_path_derived_execute_bits(self) -> None:
+        values = {
+            "st_dev": 1,
+            "st_ino": 2,
+            "st_mode": 0o100666,
+            "st_size": 3,
+            "st_mtime_ns": 4,
+            "st_file_attributes": 32,
+        }
+        handle_view = SimpleNamespace(**values)
+        path_view = SimpleNamespace(**{**values, "st_mode": 0o100777})
+        self.assertEqual(
+            codex_artifact._stable_identity(handle_view),
+            codex_artifact._stable_identity(path_view),
+        )
+        directory_view = SimpleNamespace(**{**values, "st_mode": 0o040777})
+        self.assertNotEqual(
+            codex_artifact._stable_identity(handle_view),
+            codex_artifact._stable_identity(directory_view),
+        )
+        changed_size = SimpleNamespace(**{**values, "st_size": 99})
+        changed_inode = SimpleNamespace(**{**values, "st_ino": 99})
+        self.assertNotEqual(
+            codex_artifact._stable_identity(handle_view),
+            codex_artifact._stable_identity(changed_size),
+        )
+        self.assertNotEqual(
+            codex_artifact._stable_identity(handle_view),
+            codex_artifact._stable_identity(changed_inode),
         )
 
     def test_rejects_non_modern_standalone_layout(self) -> None:
