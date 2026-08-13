@@ -532,9 +532,7 @@ function paymentCheckpointAuthorizer(options, batch, flow) {
     // must await the same atomic write: rewriting that shared file while an
     // earlier worker is reading it is rejected by Windows file sharing and is
     // unnecessary because the capability, PID, flow and scope are identical.
-    sharedLegacyCheckpoint ??= writePaymentCheckpoint(options, batch, flow, {
-      jobIds: [jobId],
-    });
+    sharedLegacyCheckpoint ??= writePaymentCheckpoint(options, batch, flow);
     return sharedLegacyCheckpoint;
   };
 }
