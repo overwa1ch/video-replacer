@@ -251,9 +251,9 @@ def scan_history() -> List[str]:
             text = blob.stdout.decode("utf-8")
         except UnicodeDecodeError:
             continue
-        if contains_private_home_path(
-            text, PRIVATE_HOME_RE
-        ) or contains_private_home_path(text, WINDOWS_HOME_RE):
+        if contains_private_home_path(text, PRIVATE_HOME_RE) or contains_private_home_path(
+            text, WINDOWS_HOME_RE
+        ):
             errors.append(f"Git history contains a private home path: {path}")
         if TASK_ID_RE.search(text) or (
             "test" not in relative.parts

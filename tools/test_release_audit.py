@@ -37,7 +37,11 @@ class ReleaseAuditHomePathTests(unittest.TestCase):
                 release_audit, "REQUIRED_FILES", set()
             ):
                 errors = release_audit.scan_paths(
-                    [placeholder.relative_to(root), private_posix.relative_to(root), private_windows.relative_to(root)]
+                    [
+                        placeholder.relative_to(root),
+                        private_posix.relative_to(root),
+                        private_windows.relative_to(root),
+                    ]
                 )
 
             self.assertNotIn(

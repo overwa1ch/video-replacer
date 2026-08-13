@@ -93,7 +93,9 @@ _WINDOWS_DACL_SECURITY_INFORMATION = 0x00000004
 _WINDOWS_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
 _WINDOWS_SE_FILE_OBJECT = 1
 _WINDOWS_TOKEN_QUERY = 0x0008
+_WINDOWS_TOKEN_ADJUST_DEFAULT = 0x0080
 _WINDOWS_TOKEN_USER = 1
+_WINDOWS_TOKEN_OWNER = 4
 _WINDOWS_ACL_REVISION = 2
 _WINDOWS_ACL_SIZE_INFORMATION = 2
 _WINDOWS_ACCESS_ALLOWED_ACE_TYPE = 0x00
@@ -149,6 +151,13 @@ def _windows_security_api() -> tuple[Any, Any, Any, Any]:
         ctypes.POINTER(wintypes.DWORD),
     )
     advapi32.GetTokenInformation.restype = wintypes.BOOL
+    advapi32.SetTokenInformation.argtypes = (
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    )
+    advapi32.SetTokenInformation.restype = wintypes.BOOL
     advapi32.GetLengthSid.argtypes = (wintypes.LPVOID,)
     advapi32.GetLengthSid.restype = wintypes.DWORD
     advapi32.CopySid.argtypes = (
@@ -281,6 +290,87 @@ def _windows_current_user_sid() -> Any:
         kernel32.CloseHandle(token)
 
 
+def _windows_default_owner_sid() -> Any:
+    """Return the token owner SID Windows applies to newly created objects."""
+
+    ctypes, wintypes, advapi32, kernel32 = _windows_security_api()
+
+    class _TokenOwner(ctypes.Structure):
+        _fields_ = (("owner", wintypes.LPVOID),)
+
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(
+        kernel32.GetCurrentProcess(), _WINDOWS_TOKEN_QUERY, ctypes.byref(token)
+    ):
+        raise _windows_failure("default-owner lookup", ctypes.get_last_error())
+    try:
+        required = wintypes.DWORD()
+        advapi32.GetTokenInformation(
+            token,
+            _WINDOWS_TOKEN_OWNER,
+            None,
+            0,
+            ctypes.byref(required),
+        )
+        if required.value == 0:
+            raise _windows_failure("default-owner lookup", ctypes.get_last_error())
+        token_data = ctypes.create_string_buffer(required.value)
+        if not advapi32.GetTokenInformation(
+            token,
+            _WINDOWS_TOKEN_OWNER,
+            token_data,
+            required.value,
+            ctypes.byref(required),
+        ):
+            raise _windows_failure("default-owner lookup", ctypes.get_last_error())
+        token_owner = ctypes.cast(
+            token_data, ctypes.POINTER(_TokenOwner)
+        ).contents
+        sid_length = advapi32.GetLengthSid(token_owner.owner)
+        if sid_length == 0:
+            raise _windows_failure("default-owner lookup", ctypes.get_last_error())
+        sid = ctypes.create_string_buffer(sid_length)
+        if not advapi32.CopySid(sid_length, sid, token_owner.owner):
+            raise _windows_failure("default-owner lookup", ctypes.get_last_error())
+        return sid
+    finally:
+        kernel32.CloseHandle(token)
+
+
+def _windows_set_process_default_owner_to_current_user() -> None:
+    """Make future objects use TokenUser instead of an administrator-group owner."""
+
+    ctypes, wintypes, advapi32, kernel32 = _windows_security_api()
+
+    class _TokenOwner(ctypes.Structure):
+        _fields_ = (("owner", wintypes.LPVOID),)
+
+    user_sid = _windows_current_user_sid()
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(
+        kernel32.GetCurrentProcess(),
+        _WINDOWS_TOKEN_QUERY | _WINDOWS_TOKEN_ADJUST_DEFAULT,
+        ctypes.byref(token),
+    ):
+        raise _windows_failure("default-owner update", ctypes.get_last_error())
+    try:
+        token_owner = _TokenOwner(ctypes.cast(user_sid, wintypes.LPVOID))
+        if not advapi32.SetTokenInformation(
+            token,
+            _WINDOWS_TOKEN_OWNER,
+            ctypes.byref(token_owner),
+            ctypes.sizeof(token_owner),
+        ):
+            raise _windows_failure("default-owner update", ctypes.get_last_error())
+    finally:
+        kernel32.CloseHandle(token)
+    default_owner_sid = _windows_default_owner_sid()
+    if not advapi32.EqualSid(default_owner_sid, user_sid):
+        raise CodexNodeHomeError(
+            "Windows Codex prompt-node default owner must be the current user"
+        )
+
+
 def _windows_system_sid() -> Any:
     ctypes, wintypes, advapi32, _kernel32 = _windows_security_api()
     size = wintypes.DWORD(_WINDOWS_SECURITY_MAX_SID_SIZE)
@@ -324,10 +414,8 @@ def _windows_require_current_user_owner(path: Path) -> None:
 def _windows_apply_private_acl(path: Path, *, is_directory: bool) -> None:
     """Replace the DACL with current-user and SYSTEM full-control ACEs."""
 
-    # Owners can replace a DACL through implicit WRITE_DAC, but changing the
-    # owner requires WRITE_OWNER or a privilege ordinary users do not have.
-    # The object must already belong to this user; never attempt ownership
-    # takeover or even redundantly submit OWNER_SECURITY_INFORMATION.
+    # The process default owner is set before creation. Never attempt to take
+    # ownership here: an existing object must already belong to this user.
     _windows_require_current_user_owner(path)
     ctypes, wintypes, advapi32, _kernel32 = _windows_security_api()
     user_sid = _windows_current_user_sid()
@@ -908,6 +996,7 @@ def ensure_node_home(
 ) -> Path:
     absolute = Path(os.path.abspath(os.fspath(path.expanduser())))
     if _is_windows_host():
+        _windows_set_process_default_owner_to_current_user()
         _windows_require_local_fixed_path(absolute)
     if path_contains_link_like(absolute):
         raise CodexNodeHomeError(
@@ -955,6 +1044,10 @@ def locked_node_home(home: Path, *, timeout_seconds: float = 120.0) -> Iterator[
     lock_path = home / LOCK_FILENAME
     descriptor: Optional[int] = None
     try:
+        if _is_windows_host():
+            # This also governs a newly created lock and any auth replacement
+            # performed by a Codex child process while the lock is held.
+            _windows_set_process_default_owner_to_current_user()
         if not home.is_dir() or path_contains_link_like(home):
             raise CodexNodeHomeError(
                 "Codex prompt-node credential home is unsafe before locking"

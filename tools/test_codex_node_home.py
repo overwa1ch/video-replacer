@@ -280,6 +280,8 @@ class CodexNodeHomeTests(unittest.TestCase):
         with mock.patch.object(
             node_home, "_is_windows_host", return_value=True
         ), mock.patch.object(
+            node_home, "_windows_set_process_default_owner_to_current_user"
+        ), mock.patch.object(
             node_home, "_windows_require_local_fixed_path"
         ) as require_local, mock.patch.object(
             node_home, "path_contains_link_like", return_value=False
@@ -318,6 +320,8 @@ class CodexNodeHomeTests(unittest.TestCase):
         with mock.patch.object(
             node_home, "_is_windows_host", return_value=True
         ), mock.patch.object(
+            node_home, "_windows_set_process_default_owner_to_current_user"
+        ), mock.patch.object(
             node_home, "_windows_require_local_fixed_path"
         ), mock.patch.object(
             node_home, "path_contains_link_like", return_value=False
@@ -354,6 +358,87 @@ class CodexNodeHomeTests(unittest.TestCase):
         require_owner.assert_called_once_with(candidate)
         security_api.assert_not_called()
 
+    def test_windows_sets_current_user_default_owner_before_creating_home(self) -> None:
+        home = self.root / "new-state" / node_home.NODE_HOME_DIRECTORY
+
+        def require_before_create() -> None:
+            self.assertFalse(home.exists())
+
+        with mock.patch.object(
+            node_home, "_is_windows_host", return_value=True
+        ), mock.patch.object(
+            node_home,
+            "_windows_set_process_default_owner_to_current_user",
+            side_effect=require_before_create,
+        ) as set_default_owner, mock.patch.object(
+            node_home, "_windows_require_local_fixed_path"
+        ), mock.patch.object(
+            node_home, "path_contains_link_like", return_value=False
+        ), mock.patch.object(
+            node_home, "is_link_like", return_value=False
+        ), mock.patch.object(
+            node_home, "_temporary_roots", return_value=set()
+        ), mock.patch.object(
+            node_home, "_windows_apply_private_acl"
+        ), mock.patch.object(
+            node_home, "_windows_verify_private_acl"
+        ):
+            result = node_home.ensure_node_home(
+                home, repo_root=self.repo, source={}
+            )
+
+        self.assertEqual(result, home.resolve())
+        set_default_owner.assert_called_once_with()
+
+    def test_windows_default_owner_failure_blocks_before_creating_home(self) -> None:
+        home = self.root / "blocked-state" / node_home.NODE_HOME_DIRECTORY
+        with mock.patch.object(
+            node_home, "_is_windows_host", return_value=True
+        ), mock.patch.object(
+            node_home,
+            "_windows_set_process_default_owner_to_current_user",
+            side_effect=node_home.CodexNodeHomeError("default-owner update failed"),
+        ), self.assertRaisesRegex(
+            node_home.CodexNodeHomeError, "default-owner update failed"
+        ):
+            node_home.ensure_node_home(home, repo_root=self.repo, source={})
+
+        self.assertFalse(home.exists())
+
+    def test_windows_lock_sets_current_user_default_owner_before_open(self) -> None:
+        home = self._home()
+        lock = home / node_home.LOCK_FILENAME
+        fake_msvcrt = types.SimpleNamespace(
+            LK_NBLCK=1,
+            LK_UNLCK=2,
+            locking=mock.Mock(),
+        )
+
+        def require_before_open() -> None:
+            self.assertFalse(lock.exists())
+
+        with mock.patch.object(
+            node_home, "_is_windows_host", return_value=True
+        ), mock.patch.object(
+            node_home,
+            "_windows_set_process_default_owner_to_current_user",
+            side_effect=require_before_open,
+        ) as set_default_owner, mock.patch.object(
+            node_home, "_windows_require_local_fixed_path"
+        ), mock.patch.object(
+            node_home, "path_contains_link_like", return_value=False
+        ), mock.patch.object(
+            node_home, "is_link_like", return_value=False
+        ), mock.patch.object(
+            node_home, "_windows_apply_private_acl"
+        ), mock.patch.object(
+            node_home, "_windows_verify_private_acl"
+        ), mock.patch.dict(sys.modules, {"msvcrt": fake_msvcrt}):
+            with node_home.locked_node_home(home, timeout_seconds=1):
+                pass
+
+        set_default_owner.assert_called_once_with()
+
     def test_windows_link_check_uses_native_reparse_attributes(self) -> None:
         candidate = self.root / "junction"
         with mock.patch.object(
@@ -375,6 +460,8 @@ class CodexNodeHomeTests(unittest.TestCase):
         )
         with mock.patch.object(
             node_home, "_is_windows_host", return_value=True
+        ), mock.patch.object(
+            node_home, "_windows_set_process_default_owner_to_current_user"
         ), mock.patch.object(
             node_home, "_windows_require_local_fixed_path"
         ), mock.patch.object(
