@@ -104,10 +104,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "video-replacer.cmd status failed" }
           if (-not (Test-Path -LiteralPath 'workspace\video-loop\inbox' -PathType Container)) { throw 'runtime inbox missing' }
           if (-not (Test-Path -LiteralPath 'outputs\video-replacements' -PathType Container)) { throw 'output directory missing' }
-          & .\video-replacer.cmd setup status --json
-          if ($LASTEXITCODE -eq 0) { throw 'setup status unexpectedly passed without a verified record' }
-          & .\video-replacer.cmd once
-          if ($LASTEXITCODE -eq 0) { throw 'task command unexpectedly passed before READY' }
+          $launcher = (Resolve-Path -LiteralPath '.\video-replacer.cmd').Path
+          $setupStatus = Start-Process -FilePath $env:ComSpec -ArgumentList '/D', '/S', '/C', ('call "' + $launcher + '" setup status --json') -Wait -PassThru -NoNewWindow
+          if ($setupStatus.ExitCode -eq 0) { throw 'setup status unexpectedly passed without a verified record' }
+          $task = Start-Process -FilePath $env:ComSpec -ArgumentList '/D', '/S', '/C', ('call "' + $launcher + '" once') -Wait -PassThru -NoNewWindow
+          if ($task.ExitCode -eq 0) { throw 'task command unexpectedly passed before READY' }
       - name: Test and release audit (POSIX entrypoint)
         if: runner.os != 'Windows'
         shell: bash
