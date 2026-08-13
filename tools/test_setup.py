@@ -213,6 +213,7 @@ class SetupTests(unittest.TestCase):
         self.assertIn(
             Path("tools/codex_wire_attestation.py"), setup.SETUP_CONTRACT_FILES
         )
+        self.assertIn(Path("tools/dreamina-version.json"), setup.SETUP_CONTRACT_FILES)
 
     def test_tool_change_invalidates_record(self) -> None:
         self.verify()

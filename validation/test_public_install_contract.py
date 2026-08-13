@@ -59,6 +59,7 @@ class PublicInstallContractTests(unittest.TestCase):
             "tools/doctor.py",
             "tools/install_dreamina.py",
             "tools/dreamina-install-manifest.json",
+            "tools/dreamina-version.json",
             "tools/setup.py",
             "tools/state_paths.py",
             "tools/release_audit.py",
@@ -142,9 +143,9 @@ class PublicInstallContractTests(unittest.TestCase):
             ".\\video-replacer.cmd status --json",
             ".\\video-replacer-test.cmd",
             ".\\tools\\install_dreamina.py",
-            ".\\.video-replacer\\bin\\dreamina.exe version",
         ):
             self.assertIn(phrase, workflow)
+        self.assertNotIn(".\\.video-replacer\\bin\\dreamina.exe version", workflow)
 
     def test_windows_release_label_has_a_real_machine_hard_gate(self) -> None:
         release = (REPO_ROOT / "RELEASE.md").read_text(encoding="utf-8")
@@ -235,6 +236,29 @@ class PublicInstallContractTests(unittest.TestCase):
         self.assertIn("SHA-256", installer + first_run)
         self.assertNotIn("curl -fsSL https://jimeng.jianying.com/cli | bash", installer)
         self.assertIn("does not execute the provider's remote shell installer", first_run)
+
+    def test_dreamina_version_metadata_write_boundary_is_public(self) -> None:
+        documents = (
+            REPO_ROOT / "README.md",
+            REPO_ROOT / "SECURITY.md",
+            REPO_ROOT / "ARCHITECTURE.md",
+            REPO_ROOT
+            / ".agents"
+            / "skills"
+            / "video-replacer"
+            / "references"
+            / "first-run-setup.md",
+        )
+        text = "\n".join(path.read_text(encoding="utf-8") for path in documents)
+        for phrase in (
+            "tools/dreamina-version.json",
+            "~/.dreamina_cli/version.json",
+            r"%USERPROFILE%\.dreamina_cli\version.json",
+            "non-sensitive",
+            "credential files",
+            "link-like",
+        ):
+            self.assertIn(phrase, text)
 
     def test_bootstrap_environment_does_not_forward_provider_credentials(self) -> None:
         source = {

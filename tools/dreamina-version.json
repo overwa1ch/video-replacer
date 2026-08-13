@@ -1,0 +1,5 @@
+{
+    "version": "1.4.15",
+    "release_date": "2026-08-01",
+    "release_notes": "新增：视频生成支持 Seedance 2.5 模型\ntext2video、image2video、frames2video、multimodal2video 可通过 --model_version=seedance2.5 使用\n支持 480P、720P 和 4～30 秒输出；多模态支持 2～30 秒参考音视频及纯音频输入\n更新命令：curl -fsSL https://jimeng.jianying.com/cli | bash"
+}

@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import stat
 import subprocess
 import sys
@@ -24,10 +25,14 @@ from typing import BinaryIO, Dict, Mapping, Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_PATH = Path(__file__).with_name("dreamina-install-manifest.json")
+VERSION_METADATA_SOURCE = Path(__file__).with_name("dreamina-version.json")
 INSTALL_ROOT = REPO_ROOT / ".video-replacer" / "bin"
 TARGET_PATH = INSTALL_ROOT / ("dreamina.exe" if os.name == "nt" else "dreamina")
 MAX_DOWNLOAD_BYTES = 256 * 1024 * 1024
-VERSION_CHECK_TIMEOUT_SECONDS = 120 if os.name == "nt" else 30
+MAX_VERSION_METADATA_BYTES = 64 * 1024
+VERSION_CHECK_TIMEOUT_SECONDS = 30
+VERSION_RE = re.compile(r"^[0-9]+(?:\.[0-9]+){1,3}(?:[-+][A-Za-z0-9.-]+)?$")
+DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 
 
 class InstallError(RuntimeError):
@@ -43,6 +48,7 @@ def read_manifest(path: Path = MANIFEST_PATH) -> Dict[str, object]:
         "schema_version",
         "version",
         "version_manifest_url",
+        "version_manifest_sha256",
         "official_installer_url",
         "artifacts",
     }:
@@ -52,6 +58,11 @@ def read_manifest(path: Path = MANIFEST_PATH) -> Dict[str, object]:
     artifacts = payload.get("artifacts")
     if not isinstance(artifacts, dict):
         raise InstallError("installer manifest artifacts are invalid")
+    version_digest = payload.get("version_manifest_sha256")
+    if not isinstance(version_digest, str) or len(version_digest) != 64 or any(
+        character not in "0123456789abcdef" for character in version_digest
+    ):
+        raise InstallError("installer version metadata SHA-256 is invalid")
     return payload
 
 
@@ -145,11 +156,18 @@ def safe_environment() -> Dict[str, str]:
         "SYSTEMROOT",
         "WINDIR",
     }
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if key.upper() in allowed or key.upper().startswith("LC_")
-    }
+    environment: Dict[str, str] = {}
+    for key, value in os.environ.items():
+        normalized = key.upper()
+        if os.name == "nt":
+            if normalized not in allowed and not normalized.startswith("LC_"):
+                continue
+            previous = environment.get(normalized)
+            if previous is not None and previous != value:
+                raise InstallError(f"conflicting environment values for {normalized}")
+            environment[normalized] = value
+        elif key in allowed or key.startswith("LC_"):
+            environment[key] = value
     environment["PYTHONUTF8"] = "1"
     environment["PYTHONIOENCODING"] = "utf-8"
     return environment
@@ -161,7 +179,246 @@ def is_link_like(path: Path) -> bool:
     if path.is_symlink():
         return True
     is_junction = getattr(path, "is_junction", None)
-    return bool(is_junction and is_junction())
+    if is_junction and is_junction():
+        return True
+    try:
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    except OSError:
+        attributes = 0
+    return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+
+
+def path_entry_exists(path: Path) -> bool:
+    """Return true for ordinary entries and broken links."""
+
+    return os.path.lexists(path)
+
+
+def strict_json_object(data: bytes, *, label: str) -> Dict[str, object]:
+    def pairs_object(pairs):
+        result: Dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise InstallError(f"{label} contains duplicate JSON fields")
+            result[key] = value
+        return result
+
+    try:
+        payload = json.loads(data.decode("utf-8"), object_pairs_hook=pairs_object)
+    except InstallError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise InstallError(f"{label} is not valid UTF-8 JSON") from exc
+    if not isinstance(payload, dict):
+        raise InstallError(f"{label} must be a JSON object")
+    return payload
+
+
+def validate_version_metadata_payload(
+    data: bytes, *, expected_version: Optional[str] = None, label: str
+) -> Dict[str, object]:
+    if not data or len(data) > MAX_VERSION_METADATA_BYTES:
+        raise InstallError(f"{label} has an invalid size")
+    payload = strict_json_object(data, label=label)
+    required = {"version", "release_date", "release_notes"}
+    if not required.issubset(payload):
+        raise InstallError(f"{label} fields are invalid")
+    version = payload.get("version")
+    release_date = payload.get("release_date")
+    release_notes = payload.get("release_notes")
+    if not isinstance(version, str) or not VERSION_RE.fullmatch(version):
+        raise InstallError(f"{label} version is invalid")
+    if expected_version is not None and version != expected_version:
+        raise InstallError(f"{label} version does not match the installer manifest")
+    if not isinstance(release_date, str) or not DATE_RE.fullmatch(release_date):
+        raise InstallError(f"{label} release date is invalid")
+    if not isinstance(release_notes, str) or not release_notes.strip():
+        raise InstallError(f"{label} release notes are invalid")
+    return payload
+
+
+def pinned_version_metadata(manifest: Mapping[str, object]) -> bytes:
+    try:
+        data = VERSION_METADATA_SOURCE.read_bytes()
+    except OSError as exc:
+        raise InstallError("unable to read pinned Dreamina version metadata") from exc
+    expected_digest = manifest.get("version_manifest_sha256")
+    if hashlib.sha256(data).hexdigest() != expected_digest:
+        raise InstallError("pinned Dreamina version metadata SHA-256 mismatch")
+    expected_version = manifest.get("version")
+    if not isinstance(expected_version, str):
+        raise InstallError("installer manifest version is invalid")
+    validate_version_metadata_payload(
+        data,
+        expected_version=expected_version,
+        label="pinned Dreamina version metadata",
+    )
+    return data
+
+
+def dreamina_home(
+    environment: Mapping[str, str], *, windows: Optional[bool] = None
+) -> Path:
+    variable = "USERPROFILE" if (os.name == "nt" if windows is None else windows) else "HOME"
+    raw = environment.get(variable)
+    if not isinstance(raw, str) or not raw.strip():
+        raise InstallError(f"{variable} is required for Dreamina metadata")
+    home = Path(raw)
+    if not home.is_absolute():
+        raise InstallError(f"{variable} must be an absolute path")
+    if not home.is_dir() or is_link_like(home):
+        raise InstallError(f"refusing unsafe Dreamina home: {home}")
+    return home
+
+
+def _safe_metadata_root(home: Path) -> tuple[Path, bool, tuple[int, int]]:
+    root = home / ".dreamina_cli"
+    created = False
+    if path_entry_exists(root):
+        if is_link_like(root) or not root.is_dir():
+            raise InstallError(f"refusing unsafe Dreamina metadata directory: {root}")
+    else:
+        try:
+            root.mkdir(mode=0o700)
+            created = True
+        except FileExistsError:
+            pass
+        if is_link_like(root) or not root.is_dir():
+            raise InstallError(f"refusing unsafe Dreamina metadata directory: {root}")
+        if os.name != "nt" and created:
+            root.chmod(0o700)
+    identity = root.stat()
+    return root, created, (identity.st_dev, identity.st_ino)
+
+
+def _read_existing_version_metadata(target: Path) -> bytes:
+    if is_link_like(target) or not target.is_file():
+        raise InstallError(f"refusing unsafe Dreamina version metadata: {target}")
+    before = target.stat()
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(target, flags)
+        with os.fdopen(descriptor, "rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if not stat.S_ISREG(opened.st_mode):
+                raise InstallError(
+                    f"refusing unsafe Dreamina version metadata: {target}"
+                )
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                raise InstallError("Dreamina version metadata changed while reading")
+            data = handle.read(MAX_VERSION_METADATA_BYTES + 1)
+    except OSError as exc:
+        raise InstallError("unable to read existing Dreamina version metadata") from exc
+    if is_link_like(target) or not target.is_file():
+        raise InstallError("Dreamina version metadata changed while reading")
+    after = target.stat()
+    if (after.st_dev, after.st_ino, after.st_size) != (
+        opened.st_dev,
+        opened.st_ino,
+        opened.st_size,
+    ):
+        raise InstallError("Dreamina version metadata changed while reading")
+    validate_version_metadata_payload(data, label="existing Dreamina version metadata")
+    return data
+
+
+def provision_version_metadata(
+    environment: Mapping[str, str], data: bytes
+) -> Dict[str, object]:
+    """Create missing provider metadata without overwriting another installation."""
+
+    home = dreamina_home(environment)
+    root, root_created, root_identity = _safe_metadata_root(home)
+    target = root / "version.json"
+    if path_entry_exists(target):
+        existing = _read_existing_version_metadata(target)
+        return {
+            "path": str(target),
+            "status": "preserved",
+            "sha256": hashlib.sha256(existing).hexdigest(),
+            "created_root": root_created,
+        }
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".version.json.", suffix=".tmp", dir=root
+    )
+    temporary = Path(temporary_name)
+    try:
+        if os.name != "nt":
+            os.fchmod(descriptor, stat.S_IRUSR | stat.S_IWUSR)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if is_link_like(root) or not root.is_dir():
+            raise InstallError(f"refusing changed Dreamina metadata directory: {root}")
+        current_root = root.stat()
+        if (current_root.st_dev, current_root.st_ino) != root_identity:
+            raise InstallError("Dreamina metadata directory changed during installation")
+        try:
+            # A same-directory hard link publishes fully written bytes without
+            # replacing a file created concurrently by another installation.
+            os.link(temporary, target, follow_symlinks=False)
+        except FileExistsError:
+            existing = _read_existing_version_metadata(target)
+            return {
+                "path": str(target),
+                "status": "preserved",
+                "sha256": hashlib.sha256(existing).hexdigest(),
+                "created_root": root_created,
+            }
+        except OSError as exc:
+            raise InstallError("unable to publish Dreamina version metadata safely") from exc
+        if is_link_like(target) or not target.is_file():
+            raise InstallError(f"Dreamina version metadata was not installed safely: {target}")
+        identity = target.stat()
+        installed = _read_existing_version_metadata(target)
+        if installed != data:
+            raise InstallError("Dreamina version metadata changed during installation")
+        return {
+            "path": str(target),
+            "status": "created",
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "created_root": root_created,
+            "device": identity.st_dev,
+            "inode": identity.st_ino,
+        }
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+def rollback_created_version_metadata(metadata: Mapping[str, object], data: bytes) -> None:
+    if metadata.get("status") != "created":
+        return
+    target = Path(str(metadata.get("path", "")))
+    try:
+        if is_link_like(target) or not target.is_file():
+            return
+        identity = target.stat()
+        if identity.st_dev != metadata.get("device") or identity.st_ino != metadata.get("inode"):
+            return
+        with target.open("rb") as handle:
+            current = handle.read(MAX_VERSION_METADATA_BYTES + 1)
+        if current != data:
+            return
+        final_identity = target.stat()
+        if (
+            final_identity.st_dev != metadata.get("device")
+            or final_identity.st_ino != metadata.get("inode")
+        ):
+            return
+        target.unlink()
+        if metadata.get("created_root"):
+            try:
+                target.parent.rmdir()
+            except OSError:
+                pass
+    except OSError:
+        # Rollback is best effort and never replaces state created elsewhere.
+        return
 
 
 def ensure_install_root() -> None:
@@ -177,20 +434,21 @@ def ensure_install_root() -> None:
 def reported_version(output: str) -> str:
     text = output.strip()
     try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
-        payload = None
-    if isinstance(payload, dict):
-        version = payload.get("version")
-        commit = payload.get("commit")
-        if isinstance(version, str) and version:
-            return version + (f" ({commit})" if isinstance(commit, str) and commit else "")
-    return text.splitlines()[0][:240] if text else ""
+        payload = strict_json_object(text.encode("utf-8"), label="Dreamina version output")
+    except InstallError:
+        return ""
+    version = payload.get("version")
+    commit = payload.get("commit")
+    if not isinstance(version, str) or not version.strip():
+        return ""
+    return version + (f" ({commit})" if isinstance(commit, str) and commit else "")
 
 
 def install(*, opener=urllib.request.urlopen) -> Dict[str, object]:
     manifest = read_manifest()
     artifact = artifact_for(manifest)
+    version_metadata = pinned_version_metadata(manifest)
+    environment = safe_environment()
     ensure_install_root()
     request = urllib.request.Request(
         artifact["url"], headers={"User-Agent": "video-replacer-installer/1"}
@@ -216,29 +474,29 @@ def install(*, opener=urllib.request.urlopen) -> Dict[str, object]:
             )
         if os.name != "nt":
             candidate.chmod(0o700)
-        completed = subprocess.run(
-            [str(candidate), "version"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-            # Windows may cold-scan a newly downloaded 32 MiB executable
-            # before CreateProcess returns. Keep the check bounded while
-            # allowing that first-launch security scan to finish.
-            timeout=VERSION_CHECK_TIMEOUT_SECONDS,
-            env=safe_environment(),
-        )
-        if completed.returncode != 0:
-            raise InstallError("downloaded Dreamina CLI failed its version check")
-        binary_version = reported_version(completed.stdout)
-        if not binary_version:
-            raise InstallError("downloaded Dreamina CLI returned no version")
-        os.replace(candidate, TARGET_PATH)
-        if os.name != "nt":
-            TARGET_PATH.chmod(0o700)
+        metadata = provision_version_metadata(environment, version_metadata)
+        try:
+            completed = subprocess.run(
+                [str(candidate), "version"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=VERSION_CHECK_TIMEOUT_SECONDS,
+                env=environment,
+            )
+            if completed.returncode != 0:
+                raise InstallError("downloaded Dreamina CLI failed its version check")
+            binary_version = reported_version(completed.stdout)
+            if not binary_version:
+                raise InstallError("downloaded Dreamina CLI returned invalid version JSON")
+            os.replace(candidate, TARGET_PATH)
+        except BaseException:
+            rollback_created_version_metadata(metadata, version_metadata)
+            raise
     return {
         "installed": True,
         "path": str(TARGET_PATH),
@@ -246,6 +504,11 @@ def install(*, opener=urllib.request.urlopen) -> Dict[str, object]:
         "binary_version": binary_version,
         "sha256": artifact["sha256"],
         "bytes": size,
+        "version_metadata": {
+            "path": metadata["path"],
+            "status": metadata["status"],
+            "sha256": metadata["sha256"],
+        },
         "modified_shell": False,
         "installed_global_skill": False,
     }

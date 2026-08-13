@@ -58,8 +58,6 @@ jobs:
         run: |
           & .\.venv\Scripts\python.exe .\tools\install_dreamina.py
           if ($LASTEXITCODE -ne 0) { throw "install_dreamina.py failed with exit code $LASTEXITCODE" }
-          & .\.video-replacer\bin\dreamina.exe version
-          if ($LASTEXITCODE -ne 0) { throw "pinned Dreamina Windows binary version check failed" }
       - name: Install pinned official native Codex for zero-tool wire attestation
         if: runner.os == 'Windows'
         shell: pwsh

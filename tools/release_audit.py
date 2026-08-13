@@ -33,6 +33,7 @@ REQUIRED_FILES = {
     Path("tools/codex_wire_attestation.py"),
     Path("tools/doctor.py"),
     Path("tools/dreamina-install-manifest.json"),
+    Path("tools/dreamina-version.json"),
     Path("tools/install_dreamina.py"),
     Path("tools/setup.py"),
     Path("tools/state_paths.py"),

@@ -121,7 +121,7 @@ video-replacer/
 | `dreamina_cli_seedance_2_5` | 即梦 CLI / Seedance 2.5 | 200,000,000 bytes | 190,000,000 bytes |
 | `dreamina_cli_seedance_2_0` | 即梦 CLI / Seedance 2.0 | 50,000,000 bytes | 47,000,000 bytes |
 
-Agent 可以用既有 Dreamina CLI 判断账号是否已授权，但公开 READY 始终使用仓库内的受控安装器下载官方固定版本、校验 SHA-256，并只执行 ignored 的 `.video-replacer/bin/dreamina`（Windows 为 `dreamina.exe`）。任意 PATH/自定义 CLI 不能写入 READY。需要登录时，Agent 只通过平台 launcher 的 `setup login-dreamina` 子命令发起，不直接执行 provider 二进制。安装器不会运行官方远程 shell 安装脚本、修改 PATH 或安装全局 Skill。
+Agent 可以用既有 Dreamina CLI 判断账号是否已授权，但公开 READY 始终使用仓库内的受控安装器下载官方固定版本、校验 SHA-256，并只执行 ignored 的 `.video-replacer/bin/dreamina`（Windows 为 `dreamina.exe`）。安装器同时校验仓库受审的 `tools/dreamina-version.json`，并在执行有超时边界的真实 `dreamina version` 检查前，仅在缺失时将它原子创建为当前用户的 `~/.dreamina_cli/version.json`（Windows 为 `%USERPROFILE%\.dreamina_cli\version.json`）。已有且 schema 合法的普通 provider 元数据会被保留；格式错误、非常规、symlink、Windows reparse 等不安全状态会 fail closed。该文件仅包含官方版本/更新元数据，Dreamina 凭证文件不在写入范围内。任意 PATH/自定义 CLI 不能写入 READY。需要登录时，Agent 只通过平台 launcher 的 `setup login-dreamina` 子命令发起，不直接执行 provider 二进制。安装器不会运行官方远程 shell 安装脚本、修改 PATH 或安装全局 Skill。
 
 Ark API adapter 代码保留用于内部开发和测试，但当前环境变量密钥方案不能提供跨 Agent session 的持久安装，也缺少可信的无付费账号/模型能力 probe，因此不属于公开 launcher/operator 路径，也不会被 `setup verify` 标记为 READY。未来只有加入受审 credential broker 与完整 probe 后才进入同一安装合同。[.env.example](.env.example) 仅是开发者字段合同，不是下载者安装步骤。
 

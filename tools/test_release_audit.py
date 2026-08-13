@@ -13,6 +13,9 @@ from tools import release_audit
 
 
 class ReleaseAuditHomePathTests(unittest.TestCase):
+    def test_pinned_dreamina_version_metadata_is_required(self) -> None:
+        self.assertIn(Path("tools/dreamina-version.json"), release_audit.REQUIRED_FILES)
+
     def test_payload_allows_placeholder_homes_and_rejects_real_users(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
