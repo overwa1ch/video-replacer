@@ -314,9 +314,14 @@ class CodexPromptNodeWireAttestationTest(unittest.TestCase):
             _write_fixture_auth(codex_home)
             try:
                 source_environment = dict(os.environ)
-                source_environment["OPENAI_API_KEY"] = (
-                    "fixture-fallback-must-not-be-used"
-                )
+                for credential_name in (
+                    "CODEX_ACCESS_TOKEN",
+                    "CODEX_API_KEY",
+                    "OPENAI_API_KEY",
+                ):
+                    source_environment[credential_name] = (
+                        "fixture-fallback-must-not-be-used"
+                    )
                 report = attest_prompt_node_file_auth(
                     binary,
                     codex_home,

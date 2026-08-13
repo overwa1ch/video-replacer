@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
@@ -1668,7 +1669,7 @@ def extract_video_prompt_frames(
         size_bytes, digest = _hash_without_change(path)
         records.append(
             {
-                "image": str(path.relative_to(frame_root.parents[1])),
+                "image": path.relative_to(frame_root.parents[1]).as_posix(),
                 "timestamp_seconds": round(max(0.0, min(timestamp, duration)), 3),
                 "size_bytes": size_bytes,
                 "sha256": digest,
@@ -1797,7 +1798,7 @@ def write_video_to_prompt_node_input(
                 "semantic_name": semantic_name,
                 "size_bytes": actual_size,
                 "sha256": actual_sha256,
-                "image": str(staged_path.relative_to(workspace)),
+                "image": staged_path.relative_to(workspace).as_posix(),
             }
         )
 
@@ -2242,7 +2243,10 @@ def _run_codex_exec(
         raise LoopError("节点执行必须绑定至少一个 Job")
     timeout_seconds = _node_exec_timeout_seconds()
     started_at = utc_now()
-    invocation_id = datetime.now().strftime("%Y%m%d-%H%M%S-%f") + f"-{os.getpid()}"
+    invocation_id = (
+        datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        + f"-{os.getpid()}-{uuid.uuid4().hex}"
+    )
     scope_name = "-".join(scoped_ids) + f"-{stage}"
     result_root = (
         batch
@@ -3898,7 +3902,7 @@ def load_submission_plan(
     seen_images: Set[str] = set()
     for raw_image in images:
         relative = _plan_reference_relative_path(raw_image, batch)
-        indexed_key = str(Path("replacements") / relative)
+        indexed_key = (Path("replacements") / relative).as_posix()
         if indexed_key not in indexed_paths:
             raise LoopError(f"{job_id} image 未出现在可信 reference-index：{relative}")
         image = _path_within(replacement_root / relative, replacement_root, "image")
