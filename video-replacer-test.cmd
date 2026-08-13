@@ -25,7 +25,7 @@ if errorlevel 1 goto failed
 if errorlevel 1 goto failed
 "%NODE_BINARY%" --check tools\video_batch_orchestrator.mjs
 if errorlevel 1 goto failed
-"%PYTHON_BINARY%" -m py_compile tools\bootstrap.py tools\doctor.py tools\install_dreamina.py tools\setup.py tools\state_paths.py tools\codex_node_home.py tools\codex_artifact.py tools\codex_wire_attestation.py tools\windows_launcher.py tools\release_audit.py tools\backend_profiles.py tools\upload_preparation.py tools\video_batch_loop.py tools\dreamina_video.py tools\ark_video.py tools\prepare_reference_video.py tools\privacy\face_mosaic.py
+"%PYTHON_BINARY%" -m py_compile tools\bootstrap.py tools\doctor.py tools\install_dreamina.py tools\dreamina_environment.py tools\setup.py tools\state_paths.py tools\codex_node_home.py tools\codex_artifact.py tools\codex_wire_attestation.py tools\windows_launcher.py tools\release_audit.py tools\backend_profiles.py tools\upload_preparation.py tools\video_batch_loop.py tools\dreamina_video.py tools\ark_video.py tools\prepare_reference_video.py tools\privacy\face_mosaic.py
 if errorlevel 1 goto failed
 "%PYTHON_BINARY%" tools\release_audit.py
 if errorlevel 1 goto failed

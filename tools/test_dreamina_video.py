@@ -38,6 +38,30 @@ class DreaminaVideoTests(unittest.TestCase):
         self.assertNotIn("VIDEO_REPLACER_ARK_API_KEY", environment)
         self.assertNotIn("VIDEO_REPLACER_TOS_SECRET_KEY", environment)
 
+    def test_run_cli_uses_the_shared_dreamina_environment(self) -> None:
+        environment = {"PATH": "/provider-only", "PYTHONUTF8": "1"}
+        with mock.patch.object(
+            dreamina, "dreamina_environment", return_value=environment
+        ) as shared_environment, mock.patch.object(
+            dreamina.subprocess,
+            "run",
+            return_value=mock.Mock(returncode=0, stdout="fixture"),
+        ) as run:
+            self.assertEqual(dreamina.run_cli(["dreamina", "version"], 30), (0, "fixture"))
+        shared_environment.assert_called_once_with(None)
+        self.assertIs(run.call_args.kwargs["env"], environment)
+
+    def test_shared_environment_failure_is_a_pipeline_error(self) -> None:
+        with mock.patch.object(
+            dreamina,
+            "dreamina_environment",
+            side_effect=dreamina.DreaminaEnvironmentError("unsafe environment"),
+        ):
+            with self.assertRaisesRegex(
+                dreamina.DreaminaPipelineError, "unsafe environment"
+            ):
+                dreamina.cli_environment()
+
     def test_non_preview_generate_requires_explicit_paid_confirmation_first(self) -> None:
         args = Namespace(preview=False, confirm_paid=False)
         with mock.patch.object(dreamina, "find_dreamina") as find_binary, mock.patch.object(

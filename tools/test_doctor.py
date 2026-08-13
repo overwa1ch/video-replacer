@@ -21,6 +21,34 @@ SPEC.loader.exec_module(doctor)
 
 
 class DoctorTests(unittest.TestCase):
+    def test_dreamina_checks_use_shared_provider_environment(self) -> None:
+        binary = Path("/fixture/dreamina")
+        environment = {"PATH": "/provider-only", "PYTHONUTF8": "1"}
+        results = [
+            mock.Mock(returncode=0, stdout='{"version":"fixture"}'),
+            mock.Mock(
+                returncode=0,
+                stdout=(
+                    "--video --image --video_resolution --model_version seedance2.5"
+                ),
+            ),
+        ]
+        with mock.patch.object(
+            doctor, "dreamina_path", return_value=binary
+        ), mock.patch.object(
+            doctor, "dreamina_environment", return_value=environment.copy()
+        ) as provider_environment, mock.patch.object(
+            doctor, "run", side_effect=results
+        ) as run:
+            checks = {item.name: item for item in doctor.check_dreamina(False)}
+        provider_environment.assert_called_once_with()
+        self.assertEqual(checks["dreamina-cli"].status, "pass")
+        self.assertEqual(checks["dreamina-interface"].status, "pass")
+        for call in run.call_args_list:
+            child_environment = call.kwargs["environment"]
+            self.assertEqual(child_environment["PATH"], "/provider-only")
+            self.assertEqual(child_environment["DREAMINA_BINARY"], str(binary))
+
     def test_windows_ready_requires_native_codex_executable(self) -> None:
         self.assertTrue(doctor.supported_codex_binary(Path("codex.exe"), "nt"))
         self.assertFalse(doctor.supported_codex_binary(Path("codex.cmd"), "nt"))

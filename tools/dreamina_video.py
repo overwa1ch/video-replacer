@@ -34,6 +34,14 @@ except ModuleNotFoundError as exc:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from backend_profiles import BackendProfile, BackendProfileError, get_backend_profile
 
+try:
+    from dreamina_environment import DreaminaEnvironmentError, dreamina_environment
+except ModuleNotFoundError as exc:
+    if exc.name != "dreamina_environment":
+        raise
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from dreamina_environment import DreaminaEnvironmentError, dreamina_environment
+
 
 sys.dont_write_bytecode = True
 
@@ -63,36 +71,6 @@ AUDIO_CODEC_RE = re.compile(r"Audio:\s*([A-Za-z0-9_]+)")
 SUBMIT_ID_RE = re.compile(r'"submit_id"\s*:\s*"([^"\s]+)"')
 STATUS_RE = re.compile(r'"gen_status"\s*:\s*"([^"\s]+)"')
 FAIL_REASON_RE = re.compile(r'"fail_reason"\s*:\s*"([^"]*)"')
-SAFE_ENV_NAMES = {
-    "APPDATA",
-    "COMSPEC",
-    "HOME",
-    "HOMEDRIVE",
-    "HOMEPATH",
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "LANG",
-    "LOCALAPPDATA",
-    "LOGNAME",
-    "NO_PROXY",
-    "PATH",
-    "PATHEXT",
-    "PROGRAMDATA",
-    "REQUESTS_CA_BUNDLE",
-    "SHELL",
-    "SSL_CERT_DIR",
-    "SSL_CERT_FILE",
-    "SYSTEMDRIVE",
-    "SYSTEMROOT",
-    "TEMP",
-    "TMP",
-    "TMPDIR",
-    "USER",
-    "USERPROFILE",
-    "WINDIR",
-}
-
-
 class DreaminaPipelineError(RuntimeError):
     pass
 
@@ -102,16 +80,10 @@ def cli_environment(
 ) -> Dict[str, str]:
     """Exclude unrelated provider credentials from Dreamina subprocesses."""
 
-    source_env = os.environ if source is None else source
-    allowed = {name.casefold() for name in SAFE_ENV_NAMES}
-    environment = {
-        key: value
-        for key, value in source_env.items()
-        if key.casefold() in allowed or key.upper().startswith("LC_")
-    }
-    environment["PYTHONUTF8"] = "1"
-    environment["PYTHONIOENCODING"] = "utf-8"
-    return environment
+    try:
+        return dreamina_environment(source)
+    except DreaminaEnvironmentError as exc:
+        raise DreaminaPipelineError(str(exc)) from exc
 
 
 def resolve_dreamina_profile(args: argparse.Namespace) -> Optional[BackendProfile]:

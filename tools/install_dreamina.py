@@ -23,6 +23,13 @@ from pathlib import Path
 from typing import BinaryIO, Dict, Mapping, Optional
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from dreamina_environment import (  # noqa: E402
+    DreaminaEnvironmentError,
+    dreamina_environment,
+)
+
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_PATH = Path(__file__).with_name("dreamina-install-manifest.json")
 VERSION_METADATA_SOURCE = Path(__file__).with_name("dreamina-version.json")
@@ -129,48 +136,10 @@ def stream_download(source: BinaryIO, destination: Path) -> tuple[str, int]:
 
 
 def safe_environment() -> Dict[str, str]:
-    allowed = {
-        "APPDATA",
-        "HOME",
-        "HOMEDRIVE",
-        "HOMEPATH",
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "LANG",
-        "LOCALAPPDATA",
-        "LOGNAME",
-        "NO_PROXY",
-        "PATH",
-        "PATHEXT",
-        "PROGRAMDATA",
-        "REQUESTS_CA_BUNDLE",
-        "SHELL",
-        "SSL_CERT_DIR",
-        "SSL_CERT_FILE",
-        "TEMP",
-        "TMP",
-        "TMPDIR",
-        "USER",
-        "USERPROFILE",
-        "SYSTEMDRIVE",
-        "SYSTEMROOT",
-        "WINDIR",
-    }
-    environment: Dict[str, str] = {}
-    for key, value in os.environ.items():
-        normalized = key.upper()
-        if os.name == "nt":
-            if normalized not in allowed and not normalized.startswith("LC_"):
-                continue
-            previous = environment.get(normalized)
-            if previous is not None and previous != value:
-                raise InstallError(f"conflicting environment values for {normalized}")
-            environment[normalized] = value
-        elif key in allowed or key.startswith("LC_"):
-            environment[key] = value
-    environment["PYTHONUTF8"] = "1"
-    environment["PYTHONIOENCODING"] = "utf-8"
-    return environment
+    try:
+        return dreamina_environment()
+    except DreaminaEnvironmentError as exc:
+        raise InstallError(str(exc)) from exc
 
 
 def is_link_like(path: Path) -> bool:
@@ -343,6 +312,8 @@ def provision_version_metadata(
         prefix=".version.json.", suffix=".tmp", dir=root
     )
     temporary = Path(temporary_name)
+    published: Optional[Dict[str, object]] = None
+    failed = False
     try:
         if os.name != "nt":
             os.fchmod(descriptor, stat.S_IRUSR | stat.S_IWUSR)
@@ -359,6 +330,7 @@ def provision_version_metadata(
         try:
             # A same-directory hard link publishes fully written bytes without
             # replacing a file created concurrently by another installation.
+            temporary_identity = temporary.stat()
             os.link(temporary, target, follow_symlinks=False)
         except FileExistsError:
             existing = _read_existing_version_metadata(target)
@@ -370,24 +342,40 @@ def provision_version_metadata(
             }
         except OSError as exc:
             raise InstallError("unable to publish Dreamina version metadata safely") from exc
-        if is_link_like(target) or not target.is_file():
-            raise InstallError(f"Dreamina version metadata was not installed safely: {target}")
-        identity = target.stat()
-        installed = _read_existing_version_metadata(target)
-        if installed != data:
-            raise InstallError("Dreamina version metadata changed during installation")
-        return {
+        published = {
             "path": str(target),
             "status": "created",
             "sha256": hashlib.sha256(data).hexdigest(),
             "created_root": root_created,
-            "device": identity.st_dev,
-            "inode": identity.st_ino,
+            "device": temporary_identity.st_dev,
+            "inode": temporary_identity.st_ino,
         }
+        if is_link_like(target) or not target.is_file():
+            raise InstallError(f"Dreamina version metadata was not installed safely: {target}")
+        identity = target.stat()
+        if (identity.st_dev, identity.st_ino) != (
+            temporary_identity.st_dev,
+            temporary_identity.st_ino,
+        ):
+            raise InstallError("Dreamina version metadata identity changed")
+        installed = _read_existing_version_metadata(target)
+        if installed != data:
+            raise InstallError("Dreamina version metadata changed during installation")
+        return published
+    except BaseException:
+        failed = True
+        if published is not None:
+            rollback_created_version_metadata(published, data)
+        raise
     finally:
         if descriptor >= 0:
             os.close(descriptor)
         temporary.unlink(missing_ok=True)
+        if failed and root_created:
+            try:
+                root.rmdir()
+            except OSError:
+                pass
 
 
 def rollback_created_version_metadata(metadata: Mapping[str, object], data: bytes) -> None:
@@ -424,6 +412,18 @@ def rollback_created_version_metadata(metadata: Mapping[str, object], data: byte
 def install_candidate_for_check(candidate: Path, expected_digest: str) -> Dict[str, object]:
     """Publish the verified binary at its real path with a rollback handle."""
 
+    if is_link_like(candidate) or not candidate.is_file():
+        raise InstallError("Dreamina candidate binary is unsafe")
+    candidate_identity = candidate.stat()
+    if hashlib.sha256(candidate.read_bytes()).hexdigest() != expected_digest:
+        raise InstallError("Dreamina candidate changed before installation")
+    candidate_after = candidate.stat()
+    if (candidate_after.st_dev, candidate_after.st_ino, candidate_after.st_size) != (
+        candidate_identity.st_dev,
+        candidate_identity.st_ino,
+        candidate_identity.st_size,
+    ):
+        raise InstallError("Dreamina candidate changed before installation")
     if path_entry_exists(TARGET_PATH) and (
         is_link_like(TARGET_PATH) or not TARGET_PATH.is_file()
     ):
@@ -440,26 +440,48 @@ def install_candidate_for_check(candidate: Path, expected_digest: str) -> Dict[s
             os.link(TARGET_PATH, backup, follow_symlinks=False)
         except OSError as exc:
             raise InstallError("unable to preserve the existing Dreamina binary") from exc
+    transaction: Dict[str, object] = {
+        "backup": str(backup) if backup is not None else None,
+        "device": candidate_identity.st_dev,
+        "inode": candidate_identity.st_ino,
+        "sha256": expected_digest,
+    }
+    published = False
     try:
         os.replace(candidate, TARGET_PATH)
+        published = True
+        validate_installed_candidate(transaction)
+        return transaction
     except BaseException:
-        if backup is not None:
+        if published:
+            try:
+                rollback_installed_candidate(transaction)
+            except BaseException:
+                # Preserve the backup for explicit recovery when Windows or a
+                # concurrent process prevents restoration.
+                raise
+        elif backup is not None:
             backup.unlink(missing_ok=True)
         raise
+
+
+def validate_installed_candidate(transaction: Mapping[str, object]) -> None:
     if is_link_like(TARGET_PATH) or not TARGET_PATH.is_file():
         raise InstallError("Dreamina binary was not installed safely")
     identity = TARGET_PATH.stat()
-    if hashlib.sha256(TARGET_PATH.read_bytes()).hexdigest() != expected_digest:
+    if (
+        identity.st_dev != transaction.get("device")
+        or identity.st_ino != transaction.get("inode")
+    ):
+        raise InstallError("installed Dreamina binary identity changed")
+    if hashlib.sha256(TARGET_PATH.read_bytes()).hexdigest() != transaction.get(
+        "sha256"
+    ):
         raise InstallError("installed Dreamina binary changed before its version check")
-    return {
-        "backup": str(backup) if backup is not None else None,
-        "device": identity.st_dev,
-        "inode": identity.st_ino,
-        "sha256": expected_digest,
-    }
 
 
 def finish_installed_candidate(transaction: Mapping[str, object]) -> None:
+    validate_installed_candidate(transaction)
     backup_value = transaction.get("backup")
     if backup_value:
         Path(str(backup_value)).unlink(missing_ok=True)
@@ -475,15 +497,19 @@ def rollback_installed_candidate(transaction: Mapping[str, object]) -> None:
             current_is_ours = (
                 identity.st_dev == transaction.get("device")
                 and identity.st_ino == transaction.get("inode")
-                and hashlib.sha256(TARGET_PATH.read_bytes()).hexdigest()
-                == transaction.get("sha256")
             )
         if current_is_ours:
             if backup is not None and backup.is_file() and not is_link_like(backup):
                 os.replace(backup, TARGET_PATH)
             else:
                 TARGET_PATH.unlink()
-    finally:
+        elif backup is not None:
+            raise InstallError(
+                f"Dreamina rollback could not restore the preserved binary: {backup}"
+            )
+    except BaseException:
+        raise
+    else:
         if backup is not None:
             backup.unlink(missing_ok=True)
 
@@ -558,11 +584,10 @@ def install(*, opener=urllib.request.urlopen) -> Dict[str, object]:
                 encoding="utf-8",
                 errors="replace",
                 check=False,
-                # The reviewed Windows artifact is unsigned and may be held
-                # for an initial Defender scan before its real command starts.
-                # Metadata prevents the CLI updater from entering an
-                # unbounded network path; the executable check remains
-                # strictly bounded and must still return valid version JSON.
+                # Windows uses the shared Dreamina-only environment, whose
+                # restricted PATH prevents the provider's optional,
+                # unbounded PowerShell/CIM ancestry probe.  The real pinned
+                # executable must still return valid version JSON in-bounds.
                 timeout=VERSION_CHECK_TIMEOUT_SECONDS,
                 env=environment,
             )
@@ -573,9 +598,19 @@ def install(*, opener=urllib.request.urlopen) -> Dict[str, object]:
                 raise InstallError("downloaded Dreamina CLI returned invalid version JSON")
             finish_installed_candidate(transaction)
         except BaseException:
-            if transaction is not None:
-                rollback_installed_candidate(transaction)
-            rollback_created_version_metadata(metadata, version_metadata)
+            rollback_error: Optional[BaseException] = None
+            try:
+                if transaction is not None:
+                    rollback_installed_candidate(transaction)
+            except BaseException as exc:
+                rollback_error = exc
+            finally:
+                rollback_created_version_metadata(metadata, version_metadata)
+            if rollback_error is not None:
+                raise InstallError(
+                    "Dreamina installation failed and its preserved binary "
+                    "requires manual recovery"
+                ) from rollback_error
             raise
     return {
         "installed": True,

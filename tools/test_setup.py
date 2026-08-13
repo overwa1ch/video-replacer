@@ -214,6 +214,9 @@ class SetupTests(unittest.TestCase):
             Path("tools/codex_wire_attestation.py"), setup.SETUP_CONTRACT_FILES
         )
         self.assertIn(Path("tools/dreamina-version.json"), setup.SETUP_CONTRACT_FILES)
+        self.assertIn(
+            Path("tools/dreamina_environment.py"), setup.SETUP_CONTRACT_FILES
+        )
 
     def test_tool_change_invalidates_record(self) -> None:
         self.verify()
@@ -329,6 +332,34 @@ class SetupTests(unittest.TestCase):
             environment = call.kwargs["env"]
             self.assertNotIn("VIDEO_REPLACER_ARK_API_KEY", environment)
             self.assertNotIn("OPENAI_API_KEY", environment)
+
+    def test_dreamina_tool_identity_uses_shared_provider_environment(self) -> None:
+        self.tool_identity_patcher.stop()
+        environment = {"PATH": "/provider-only", "PYTHONUTF8": "1"}
+        try:
+            with mock.patch.object(
+                setup, "verified_dreamina_artifact"
+            ), mock.patch.object(
+                setup, "dreamina_environment", return_value=environment.copy()
+            ) as provider_environment, mock.patch.object(
+                setup.subprocess,
+                "run",
+                return_value=mock.Mock(
+                    returncode=0, stdout='{"version":"fixture"}'
+                ),
+            ) as run:
+                setup.tool_identity(
+                    "dreamina", self.tool_paths["dreamina"], self.runtime_paths
+                )
+        finally:
+            self.tool_identity_patcher.start()
+        provider_environment.assert_called_once_with()
+        child_environment = run.call_args.kwargs["env"]
+        self.assertEqual(child_environment["PATH"], "/provider-only")
+        self.assertEqual(
+            child_environment["DREAMINA_BINARY"], self.tool_paths["dreamina"]
+        )
+        self.assertNotIn("CODEX_HOME", child_environment)
 
     def test_codex_node_login_uses_stable_file_auth_home(self) -> None:
         home = Path(self.runtime_paths["codex_node_home"])

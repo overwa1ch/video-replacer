@@ -58,6 +58,7 @@ class PublicInstallContractTests(unittest.TestCase):
             "tools/bootstrap.py",
             "tools/doctor.py",
             "tools/install_dreamina.py",
+            "tools/dreamina_environment.py",
             "tools/dreamina-install-manifest.json",
             "tools/dreamina-version.json",
             "tools/setup.py",
@@ -260,6 +261,44 @@ class PublicInstallContractTests(unittest.TestCase):
             "link-like",
         ):
             self.assertIn(phrase, text)
+
+    def test_windows_dreamina_probe_mitigation_is_shared_and_bounded(self) -> None:
+        helper = (REPO_ROOT / "tools" / "dreamina_environment.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("GetWindowsDirectoryW", helper)
+        self.assertIn("GetSystemDirectoryW", helper)
+        self.assertIn("NODEFAULTCURRENTDIRECTORYINEXEPATH", helper)
+        self.assertIn("powershell.exe", helper)
+        self.assertIn("pwsh.exe", helper)
+        for relative in (
+            "tools/install_dreamina.py",
+            "tools/doctor.py",
+            "tools/setup.py",
+            "tools/dreamina_video.py",
+        ):
+            self.assertIn(
+                "dreamina_environment",
+                (REPO_ROOT / relative).read_text(encoding="utf-8"),
+                relative,
+            )
+        public_text = "\n".join(
+            (REPO_ROOT / relative).read_text(encoding="utf-8")
+            for relative in (
+                "README.md",
+                "SECURITY.md",
+                "ARCHITECTURE.md",
+                ".agents/skills/video-replacer/references/first-run-setup.md",
+                "workflows/video-replacement-batch-folder-loop-v1.md",
+                "RELEASE.md",
+            )
+        )
+        for phrase in (
+            "NoDefaultCurrentDirectoryInExePath",
+            "PowerShell/CIM",
+            "not a general subprocess sandbox",
+        ):
+            self.assertIn(phrase, public_text)
 
     def test_bootstrap_environment_does_not_forward_provider_credentials(self) -> None:
         source = {

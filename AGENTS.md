@@ -25,6 +25,7 @@
 - `tools/codex_artifact.py`：在执行 Windows Codex 前验证 modern standalone package layout/metadata，从精确官方 release manifest 取得摘要并校验实际 binary；来源无法证明时 fail closed。
 - `tools/codex_wire_attestation.py`：在同一稳定认证锁内用生产 prompt command、稳定节点 home、合成图片与 loopback Responses provider 捕获两阶段实际 request surface；无认证阶段 required check 为 `codex-wire`，认证摘要阶段 required check 为 `codex-file-auth-wire`。认证阶段以仅驻留内存的 SHA-256 与 `hmac.compare_digest` 证明 Bearer 等于严格 file-auth `access_token`；任一阶段不满足时阻断 READY。
 - `tools/install_dreamina.py`：从仓库受审 manifest 下载并校验项目内 Dreamina CLI；不执行远程 shell、不改 PATH、不安装全局 Skill。
+- `tools/dreamina_environment.py`：所有 Dreamina 子进程共用的凭证最小化环境；Windows 仅在 child process 内使用可信系统目录 PATH，阻断 pinned CLI 无超时的 bare-name PowerShell/CIM ancestry probe，不修改用户或父进程 PATH。
 - `tools/setup.py`：首次运行的后端选择、工具身份、代码合同与实时在线 Doctor 证明；只保存 ignored 的非敏感 setup record。
 - `tools/release_audit.py`：公开文件边界检查。
 

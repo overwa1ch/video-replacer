@@ -35,6 +35,10 @@ from codex_wire_attestation import (  # noqa: E402
     attest_prompt_node_wire,
 )
 from state_paths import StatePathError, resolve_state_root  # noqa: E402
+from dreamina_environment import (  # noqa: E402
+    DreaminaEnvironmentError,
+    dreamina_environment,
+)
 MINIMUM_PYTHON = (3, 12)
 MINIMUM_NODE = 20
 MINIMUM_CODEX = (0, 147, 0)
@@ -656,7 +660,18 @@ def check_dreamina(
     binary = dreamina_path()
     if not binary:
         return [Check("dreamina-cli", "fail", "Dreamina CLI was not found")]
-    environment = safe_environment()
+    try:
+        environment = dreamina_environment()
+    except DreaminaEnvironmentError as exc:
+        detail = redact_text(str(exc))
+        checks = [
+            Check("dreamina-cli", "fail", detail),
+            Check("dreamina-interface", "fail", detail),
+            Check("dreamina-model", "fail", detail),
+        ]
+        if online:
+            checks.append(Check("dreamina-login", "fail", detail))
+        return checks
     environment["DREAMINA_BINARY"] = str(binary)
     version = run([str(binary), "version"], environment=environment)
     checks = [

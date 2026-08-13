@@ -19,6 +19,7 @@ cd "$REPO_ROOT"
   tools/bootstrap.py \
   tools/doctor.py \
   tools/install_dreamina.py \
+  tools/dreamina_environment.py \
   tools/setup.py \
   tools/state_paths.py \
   tools/codex_node_home.py \

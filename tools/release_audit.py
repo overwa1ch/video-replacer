@@ -34,6 +34,7 @@ REQUIRED_FILES = {
     Path("tools/doctor.py"),
     Path("tools/dreamina-install-manifest.json"),
     Path("tools/dreamina-version.json"),
+    Path("tools/dreamina_environment.py"),
     Path("tools/install_dreamina.py"),
     Path("tools/setup.py"),
     Path("tools/state_paths.py"),

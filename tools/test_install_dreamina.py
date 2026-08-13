@@ -272,6 +272,109 @@ class DreaminaInstallerTests(unittest.TestCase):
             self.assertFalse((home / ".dreamina_cli" / "version.json").exists())
             self.assertFalse(target.exists())
 
+    def test_post_replace_validation_failure_restores_existing_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "dreamina"
+            candidate = root / "candidate"
+            old = b"existing-reviewed-binary"
+            new = b"new-reviewed-binary"
+            target.write_bytes(old)
+            candidate.write_bytes(new)
+            with mock.patch.object(installer, "INSTALL_ROOT", root), mock.patch.object(
+                installer, "TARGET_PATH", target
+            ), mock.patch.object(
+                installer,
+                "validate_installed_candidate",
+                side_effect=installer.InstallError("fixture post-replace failure"),
+            ):
+                with self.assertRaisesRegex(
+                    installer.InstallError, "post-replace failure"
+                ):
+                    installer.install_candidate_for_check(
+                        candidate, hashlib.sha256(new).hexdigest()
+                    )
+            self.assertEqual(target.read_bytes(), old)
+            self.assertEqual(list(root.glob(".dreamina.backup-*")), [])
+
+    def test_restore_failure_preserves_old_binary_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "dreamina"
+            candidate = root / "candidate"
+            old = b"existing-reviewed-binary"
+            new = b"new-reviewed-binary"
+            target.write_bytes(old)
+            candidate.write_bytes(new)
+            real_replace = installer.os.replace
+            replacements = 0
+
+            def fail_restore(source, destination):
+                nonlocal replacements
+                if Path(destination) == target:
+                    replacements += 1
+                    if replacements == 2:
+                        raise OSError("fixture restore sharing violation")
+                return real_replace(source, destination)
+
+            with mock.patch.object(installer, "INSTALL_ROOT", root), mock.patch.object(
+                installer, "TARGET_PATH", target
+            ), mock.patch.object(
+                installer,
+                "validate_installed_candidate",
+                side_effect=installer.InstallError("fixture validation failure"),
+            ), mock.patch.object(
+                installer.os, "replace", side_effect=fail_restore
+            ):
+                with self.assertRaisesRegex(OSError, "sharing violation"):
+                    installer.install_candidate_for_check(
+                        candidate, hashlib.sha256(new).hexdigest()
+                    )
+            backups = list(root.glob(".dreamina.backup-*"))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_bytes(), old)
+
+    def test_binary_mutation_before_commit_restores_existing_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "dreamina"
+            candidate = root / "candidate"
+            old = b"existing-reviewed-binary"
+            new = b"new-reviewed-binary"
+            target.write_bytes(old)
+            candidate.write_bytes(new)
+            with mock.patch.object(installer, "INSTALL_ROOT", root), mock.patch.object(
+                installer, "TARGET_PATH", target
+            ):
+                transaction = installer.install_candidate_for_check(
+                    candidate, hashlib.sha256(new).hexdigest()
+                )
+                target.write_bytes(b"mutated-in-place")
+                with self.assertRaisesRegex(installer.InstallError, "changed"):
+                    installer.finish_installed_candidate(transaction)
+                installer.rollback_installed_candidate(transaction)
+            self.assertEqual(target.read_bytes(), old)
+
+    def test_metadata_post_publish_failure_self_rolls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            original_reader = installer._read_existing_version_metadata
+            with mock.patch.object(
+                installer,
+                "_read_existing_version_metadata",
+                side_effect=installer.InstallError("fixture post-publish failure"),
+            ):
+                with self.assertRaisesRegex(
+                    installer.InstallError, "post-publish failure"
+                ):
+                    installer.provision_version_metadata(
+                        self.home_environment(home), self.pinned
+                    )
+            target = home / ".dreamina_cli" / "version.json"
+            self.assertFalse(target.exists())
+            self.assertFalse(target.parent.exists())
+            self.assertTrue(callable(original_reader))
+
     def test_version_output_must_be_json(self) -> None:
         self.assertEqual(installer.reported_version("updater timed out"), "")
         self.assertEqual(

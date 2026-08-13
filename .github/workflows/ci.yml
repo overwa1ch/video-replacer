@@ -13,10 +13,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Pin the hosted compatibility lane. The floating Windows alias maps
-        # to a Server 2025 / VS2026 preview image where the reviewed unsigned
-        # Dreamina Go binary is held indefinitely before main. Native Windows
-        # 11 remains the separate fresh-user hard Gate in RELEASE.md.
+        # Pin the hosted compatibility lane. Dreamina subprocesses also use
+        # a project-local restricted environment because the reviewed CLI's
+        # optional PowerShell/CIM ancestry probe has no upstream timeout.
+        # Native Windows 11 remains the fresh-user hard Gate in RELEASE.md.
         os: [ubuntu-latest, macos-latest, windows-2022]
     runs-on: ${{ matrix.os }}
     steps:
@@ -62,6 +62,8 @@ jobs:
         run: |
           & .\.venv\Scripts\python.exe .\tools\install_dreamina.py
           if ($LASTEXITCODE -ne 0) { throw "install_dreamina.py failed with exit code $LASTEXITCODE" }
+          & .\.venv\Scripts\python.exe -c "import subprocess; from pathlib import Path; from tools.dreamina_environment import dreamina_environment; binary=Path('.video-replacer/bin/dreamina.exe').resolve(); result=subprocess.run([str(binary),'multimodal2video','-h'],env=dreamina_environment(),stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,encoding='utf-8',errors='replace',timeout=30); required=('--video','--image','--video_resolution','--model_version'); raise SystemExit(0 if result.returncode == 0 and all(flag in result.stdout for flag in required) else 1)"
+          if ($LASTEXITCODE -ne 0) { throw "Dreamina restricted-environment interface check failed with exit code $LASTEXITCODE" }
       - name: Install pinned official native Codex for zero-tool wire attestation
         if: runner.os == 'Windows'
         shell: pwsh

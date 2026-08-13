@@ -28,6 +28,7 @@ from codex_node_home import (
     validate_node_home_structure,
 )
 from codex_artifact import CodexArtifactError, verify_windows_codex
+from dreamina_environment import DreaminaEnvironmentError, dreamina_environment
 from state_paths import StatePathError, resolve_state_root
 
 
@@ -86,6 +87,7 @@ SETUP_CONTRACT_FILES = (
     Path("tools/doctor.py"),
     Path("tools/dreamina-install-manifest.json"),
     Path("tools/dreamina-version.json"),
+    Path("tools/dreamina_environment.py"),
     Path("tools/install_dreamina.py"),
     Path("tools/setup.py"),
     Path("tools/state_paths.py"),
@@ -414,8 +416,16 @@ def tool_identity(
             raise SetupError(
                 f"official Windows Codex provenance failed before execution: {exc}"
             ) from exc
-    environment = doctor.safe_environment(extra=("CODEX_HOME", "DREAMINA_BINARY"))
-    environment["CODEX_HOME"] = runtime_paths["codex_node_home"]
+    if name == "dreamina":
+        try:
+            environment = dreamina_environment()
+        except DreaminaEnvironmentError as exc:
+            raise SetupError(str(exc)) from exc
+    else:
+        environment = doctor.safe_environment(
+            extra=("CODEX_HOME", "DREAMINA_BINARY")
+        )
+        environment["CODEX_HOME"] = runtime_paths["codex_node_home"]
     environment["DREAMINA_BINARY"] = path_text if name == "dreamina" else environment.get(
         "DREAMINA_BINARY", ""
     )
@@ -663,7 +673,10 @@ def login_dreamina() -> Dict[str, object]:
     if not binary.is_file():
         raise SetupError("reviewed project-local Dreamina CLI is not installed")
     artifact = verified_dreamina_artifact(str(binary))
-    environment = doctor.safe_environment(extra=("DREAMINA_BINARY",))
+    try:
+        environment = dreamina_environment()
+    except DreaminaEnvironmentError as exc:
+        raise SetupError(str(exc)) from exc
     environment["DREAMINA_BINARY"] = str(binary)
     completed = subprocess.run(
         [str(binary), "login"],
