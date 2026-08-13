@@ -30,7 +30,7 @@ INSTALL_ROOT = REPO_ROOT / ".video-replacer" / "bin"
 TARGET_PATH = INSTALL_ROOT / ("dreamina.exe" if os.name == "nt" else "dreamina")
 MAX_DOWNLOAD_BYTES = 256 * 1024 * 1024
 MAX_VERSION_METADATA_BYTES = 64 * 1024
-VERSION_CHECK_TIMEOUT_SECONDS = 30
+VERSION_CHECK_TIMEOUT_SECONDS = 120 if os.name == "nt" else 30
 VERSION_RE = re.compile(r"^[0-9]+(?:\.[0-9]+){1,3}(?:[-+][A-Za-z0-9.-]+)?$")
 DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 
@@ -485,6 +485,11 @@ def install(*, opener=urllib.request.urlopen) -> Dict[str, object]:
                 encoding="utf-8",
                 errors="replace",
                 check=False,
+                # The reviewed Windows artifact is unsigned and may be held
+                # for an initial Defender scan before its real command starts.
+                # Metadata prevents the CLI updater from entering an
+                # unbounded network path; the executable check remains
+                # strictly bounded and must still return valid version JSON.
                 timeout=VERSION_CHECK_TIMEOUT_SECONDS,
                 env=environment,
             )
