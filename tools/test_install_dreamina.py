@@ -203,7 +203,7 @@ class DreaminaInstallerTests(unittest.TestCase):
                 (home / ".dreamina_cli" / "version.json").read_bytes(), self.pinned
             )
             command = run.call_args
-            self.assertEqual(command.args[0][1], "version")
+            self.assertEqual(command.args[0], [str(target), "version"])
             self.assertIs(command.kwargs["stdin"], installer.subprocess.DEVNULL)
             self.assertEqual(
                 command.kwargs["timeout"], installer.VERSION_CHECK_TIMEOUT_SECONDS

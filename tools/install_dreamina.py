@@ -421,6 +421,73 @@ def rollback_created_version_metadata(metadata: Mapping[str, object], data: byte
         return
 
 
+def install_candidate_for_check(candidate: Path, expected_digest: str) -> Dict[str, object]:
+    """Publish the verified binary at its real path with a rollback handle."""
+
+    if path_entry_exists(TARGET_PATH) and (
+        is_link_like(TARGET_PATH) or not TARGET_PATH.is_file()
+    ):
+        raise InstallError(f"refusing unsafe existing Dreamina binary: {TARGET_PATH}")
+    backup: Optional[Path] = None
+    if TARGET_PATH.is_file():
+        descriptor, backup_name = tempfile.mkstemp(
+            prefix=f".{TARGET_PATH.name}.backup-", dir=INSTALL_ROOT
+        )
+        os.close(descriptor)
+        backup = Path(backup_name)
+        backup.unlink()
+        try:
+            os.link(TARGET_PATH, backup, follow_symlinks=False)
+        except OSError as exc:
+            raise InstallError("unable to preserve the existing Dreamina binary") from exc
+    try:
+        os.replace(candidate, TARGET_PATH)
+    except BaseException:
+        if backup is not None:
+            backup.unlink(missing_ok=True)
+        raise
+    if is_link_like(TARGET_PATH) or not TARGET_PATH.is_file():
+        raise InstallError("Dreamina binary was not installed safely")
+    identity = TARGET_PATH.stat()
+    if hashlib.sha256(TARGET_PATH.read_bytes()).hexdigest() != expected_digest:
+        raise InstallError("installed Dreamina binary changed before its version check")
+    return {
+        "backup": str(backup) if backup is not None else None,
+        "device": identity.st_dev,
+        "inode": identity.st_ino,
+        "sha256": expected_digest,
+    }
+
+
+def finish_installed_candidate(transaction: Mapping[str, object]) -> None:
+    backup_value = transaction.get("backup")
+    if backup_value:
+        Path(str(backup_value)).unlink(missing_ok=True)
+
+
+def rollback_installed_candidate(transaction: Mapping[str, object]) -> None:
+    backup_value = transaction.get("backup")
+    backup = Path(str(backup_value)) if backup_value else None
+    try:
+        current_is_ours = False
+        if not is_link_like(TARGET_PATH) and TARGET_PATH.is_file():
+            identity = TARGET_PATH.stat()
+            current_is_ours = (
+                identity.st_dev == transaction.get("device")
+                and identity.st_ino == transaction.get("inode")
+                and hashlib.sha256(TARGET_PATH.read_bytes()).hexdigest()
+                == transaction.get("sha256")
+            )
+        if current_is_ours:
+            if backup is not None and backup.is_file() and not is_link_like(backup):
+                os.replace(backup, TARGET_PATH)
+            else:
+                TARGET_PATH.unlink()
+    finally:
+        if backup is not None:
+            backup.unlink(missing_ok=True)
+
+
 def ensure_install_root() -> None:
     setup_root = INSTALL_ROOT.parent
     for path in (setup_root, INSTALL_ROOT):
@@ -475,9 +542,15 @@ def install(*, opener=urllib.request.urlopen) -> Dict[str, object]:
         if os.name != "nt":
             candidate.chmod(0o700)
         metadata = provision_version_metadata(environment, version_metadata)
+        transaction: Optional[Dict[str, object]] = None
         try:
+            # Match the provider's official installer order: the CLI runs from
+            # its final location. Its Windows updater derives behavior from
+            # the executable path. The transaction restores any old binary
+            # if this real-path smoke fails.
+            transaction = install_candidate_for_check(candidate, artifact["sha256"])
             completed = subprocess.run(
-                [str(candidate), "version"],
+                [str(TARGET_PATH), "version"],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -498,8 +571,10 @@ def install(*, opener=urllib.request.urlopen) -> Dict[str, object]:
             binary_version = reported_version(completed.stdout)
             if not binary_version:
                 raise InstallError("downloaded Dreamina CLI returned invalid version JSON")
-            os.replace(candidate, TARGET_PATH)
+            finish_installed_candidate(transaction)
         except BaseException:
+            if transaction is not None:
+                rollback_installed_candidate(transaction)
             rollback_created_version_metadata(metadata, version_metadata)
             raise
     return {
