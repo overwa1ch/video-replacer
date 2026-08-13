@@ -1,0 +1,13 @@
+{
+  "name": "video-replacer-workflow",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Safety-gated agentic workflow for reference-guided video replacement",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test tools/test_video_batch_orchestrator.mjs",
+    "check": "node --check tools/video_batch_orchestrator.mjs"
+  }
+}

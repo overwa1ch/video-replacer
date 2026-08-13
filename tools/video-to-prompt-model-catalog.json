@@ -1,0 +1,49 @@
+{
+  "models": [
+    {
+      "slug": "gpt-5.6-terra",
+      "display_name": "GPT-5.6-Terra (Video-to-Prompt)",
+      "description": "Reviewed image-input profile for the Video Replacer prompt node.",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Balanced visual reasoning"
+        }
+      ],
+      "shell_type": "disabled",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 1,
+      "availability_nux": null,
+      "upgrade": null,
+      "include_skills_usage_instructions": false,
+      "include_plugin_usage_instructions": false,
+      "default_reasoning_summary": "none",
+      "support_verbosity": true,
+      "default_verbosity": "low",
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "supports_image_detail_original": true,
+      "context_window": 272000,
+      "max_context_window": 272000,
+      "comp_hash": "video-to-prompt-v2",
+      "effective_context_window_percent": 95,
+      "experimental_supported_tools": [],
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "supports_search_tool": false,
+      "use_responses_lite": true,
+      "tool_mode": null,
+      "model_messages": {
+        "instructions_template": "You analyze the attached timestamped video frames and reference images for one video-replacement Job. Follow the user's explicit node contract and return only the required schema-constrained result. You have no tools, filesystem, plugins, skills, apps, or network access.",
+        "approvals": null
+      }
+    }
+  ]
+}

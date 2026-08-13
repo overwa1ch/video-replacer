@@ -1,0 +1,24 @@
+blinker==1.9.0
+cffi==2.1.0
+cheroot==11.1.2
+click==8.4.2
+cryptography==49.0.0
+Flask==3.1.3
+flatbuffers==25.12.19
+itsdangerous==2.2.0
+jaraco.functools==4.6.0
+Jinja2==3.1.6
+MarkupSafe==3.0.3
+more-itertools==11.1.0
+numpy==2.5.1
+onnxruntime==1.27.0
+opencv-python==5.0.0.93
+OpenScrub @ git+https://github.com/austinmabry/OpenScrub.git@f0f25102d34894a15de6fa81e62187e0930f489e
+packaging==26.2
+pillow==12.3.0
+protobuf==7.35.1
+pycparser==3.0
+pytesseract==0.3.13
+PyYAML==6.0.3
+RapidFuzz==3.14.5
+Werkzeug==3.1.8

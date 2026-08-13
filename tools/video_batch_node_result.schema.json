@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "batch_status": {
+      "type": "string",
+      "enum": ["COMPLETE", "BLOCKED", "FAILED"]
+    },
+    "summary": { "type": "string" },
+    "jobs": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "pattern": "^V[0-9]{3}$" },
+          "status": {
+            "type": "string",
+            "enum": ["COMPLETE", "BLOCKED", "FAILED"]
+          },
+          "blocker": { "type": ["string", "null"] },
+          "prompt": { "type": ["string", "null"] }
+        },
+        "required": ["id", "status", "blocker", "prompt"]
+      }
+    }
+  },
+  "required": ["batch_status", "summary", "jobs"]
+}

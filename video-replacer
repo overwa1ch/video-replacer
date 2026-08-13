@@ -1,0 +1,47 @@
+#!/bin/sh
+set -eu
+
+REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+NODE_BINARY=${VIDEO_REPLACER_NODE:-node}
+PYTHON_BINARY=${VIDEO_REPLACER_PYTHON:-"$REPO_ROOT/.venv/bin/python3"}
+
+if [ ! -x "$PYTHON_BINARY" ]; then
+  echo "ERROR: repository runtime is missing; run ./install first." >&2
+  exit 2
+fi
+
+if [ "${1:-}" = "setup" ]; then
+  shift
+  exec "$PYTHON_BINARY" "$REPO_ROOT/tools/setup.py" "$@"
+fi
+
+case "${1:-}" in
+  status)
+    shift
+    if [ "$#" -gt 1 ] || { [ "$#" -eq 1 ] && [ "$1" != "--json" ]; }; then
+      echo "ERROR: public status accepts only the optional --json flag." >&2
+      exit 2
+    fi
+    exec "$NODE_BINARY" \
+      "$REPO_ROOT/tools/video_batch_orchestrator.mjs" \
+      --project-root "$REPO_ROOT" \
+      --root "$REPO_ROOT/workspace/video-loop" \
+      --python "$PYTHON_BINARY" \
+      status "$@"
+    ;;
+  help|--help|-h)
+    if [ "$#" -ne 1 ]; then
+      echo "ERROR: public help does not accept infrastructure options." >&2
+      exit 2
+    fi
+    exec "$NODE_BINARY" \
+      "$REPO_ROOT/tools/video_batch_orchestrator.mjs" \
+      --project-root "$REPO_ROOT" \
+      --root "$REPO_ROOT/workspace/video-loop" \
+      --python "$PYTHON_BINARY" \
+      help
+    ;;
+  *)
+    exec "$PYTHON_BINARY" "$REPO_ROOT/tools/setup.py" launch -- "$@"
+    ;;
+esac

@@ -1,0 +1,29 @@
+#!/bin/sh
+set -eu
+
+REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_PYTHON=$REPO_ROOT/.venv/bin/python3
+
+if [ -n "${VIDEO_REPLACER_BOOTSTRAP_PYTHON:-}" ]; then
+  if command -v "$VIDEO_REPLACER_BOOTSTRAP_PYTHON" >/dev/null 2>&1 && \
+    "$VIDEO_REPLACER_BOOTSTRAP_PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)' 2>/dev/null; then
+    exec "$VIDEO_REPLACER_BOOTSTRAP_PYTHON" "$REPO_ROOT/tools/bootstrap.py" "$@"
+  fi
+  echo "ERROR: VIDEO_REPLACER_BOOTSTRAP_PYTHON is not Python 3.12 or newer." >&2
+  exit 1
+fi
+
+if [ -x "$REPOSITORY_PYTHON" ] && \
+  "$REPOSITORY_PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)' 2>/dev/null; then
+  exec "$REPOSITORY_PYTHON" "$REPO_ROOT/tools/bootstrap.py" "$@"
+fi
+
+for CANDIDATE in python3.12 python3; do
+  if command -v "$CANDIDATE" >/dev/null 2>&1 && \
+    "$CANDIDATE" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)' 2>/dev/null; then
+    exec "$CANDIDATE" "$REPO_ROOT/tools/bootstrap.py" "$@"
+  fi
+done
+
+echo "ERROR: Python 3.12 or newer is required." >&2
+exit 1

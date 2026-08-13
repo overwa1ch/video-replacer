@@ -1,0 +1,36 @@
+#!/bin/sh
+set -eu
+
+REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PYTHON_BINARY=${VIDEO_REPLACER_PYTHON:-"$REPO_ROOT/.venv/bin/python3"}
+NODE_BINARY=${VIDEO_REPLACER_NODE:-node}
+
+if [ ! -x "$PYTHON_BINARY" ]; then
+  echo "ERROR: repository runtime is missing; run ./install first." >&2
+  exit 2
+fi
+
+cd "$REPO_ROOT"
+"$PYTHON_BINARY" -m unittest discover -s validation -p 'test_*.py'
+"$PYTHON_BINARY" -m unittest discover -s tools -p 'test_*.py'
+"$NODE_BINARY" --test tools/test_video_batch_orchestrator.mjs
+"$NODE_BINARY" --check tools/video_batch_orchestrator.mjs
+"$PYTHON_BINARY" -m py_compile \
+  tools/bootstrap.py \
+  tools/doctor.py \
+  tools/install_dreamina.py \
+  tools/setup.py \
+  tools/state_paths.py \
+  tools/codex_node_home.py \
+  tools/codex_artifact.py \
+  tools/codex_wire_attestation.py \
+  tools/windows_launcher.py \
+  tools/release_audit.py \
+  tools/backend_profiles.py \
+  tools/upload_preparation.py \
+  tools/video_batch_loop.py \
+  tools/dreamina_video.py \
+  tools/ark_video.py \
+  tools/prepare_reference_video.py \
+  tools/privacy/face_mosaic.py
+"$PYTHON_BINARY" tools/release_audit.py

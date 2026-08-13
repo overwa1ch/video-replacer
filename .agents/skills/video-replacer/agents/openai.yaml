@@ -1,0 +1,4 @@
+interface:
+  display_name: "Video Replacer Operator"
+  short_description: "由 Agent 完成安装，并准备、提交视频替换任务"
+  default_prompt: "Use $video-replacer to continue directly from download through complete dependency, mosaic, durable backend, login, and live READY setup; do not defer configuration to the first video, create a paid task, or weaken the later explicit paid Gate."

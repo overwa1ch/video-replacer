@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "version": "1.4.15",
+  "version_manifest_url": "https://lf3-static.bytednsdoc.com/obj/eden-cn/psj_hupthlyk/ljhwZthlaukjlkulzlp/version.json",
+  "official_installer_url": "https://jimeng.jianying.com/cli",
+  "artifacts": {
+    "darwin_amd64": {
+      "url": "https://lf3-static.bytednsdoc.com/obj/eden-cn/psj_hupthlyk/ljhwZthlaukjlkulzlp/dreamina_cli_beta/dreamina_cli_darwin_amd64",
+      "sha256": "d1db1d121e6dc71643648bee2608855594cf64fd1f5a008da7d736df8f40fc6d"
+    },
+    "darwin_arm64": {
+      "url": "https://lf3-static.bytednsdoc.com/obj/eden-cn/psj_hupthlyk/ljhwZthlaukjlkulzlp/dreamina_cli_beta/dreamina_cli_darwin_arm64",
+      "sha256": "71342534d18601a56d2a98f95e846cfbe3b821491e0938d80f587a6842077eed"
+    },
+    "linux_amd64": {
+      "url": "https://lf3-static.bytednsdoc.com/obj/eden-cn/psj_hupthlyk/ljhwZthlaukjlkulzlp/dreamina_cli_beta/dreamina_cli_linux_amd64",
+      "sha256": "7c2817bc844e5a93cc5c6e57f876ccaea91d438e520ad50f665a515e816c7dc6"
+    },
+    "linux_arm64": {
+      "url": "https://lf3-static.bytednsdoc.com/obj/eden-cn/psj_hupthlyk/ljhwZthlaukjlkulzlp/dreamina_cli_beta/dreamina_cli_linux_arm64",
+      "sha256": "696216eee0fe55ba5e5d781429a3eb304cfdb539823397742a4d1a7575ab1202"
+    },
+    "windows_amd64": {
+      "url": "https://lf3-static.bytednsdoc.com/obj/eden-cn/psj_hupthlyk/ljhwZthlaukjlkulzlp/dreamina_cli_beta/dreamina_cli_windows_amd64.exe",
+      "sha256": "74c0de7a451f09d58f4429071015cde2d311d728e43b92ea9813741b4d2a15ac"
+    }
+  }
+}

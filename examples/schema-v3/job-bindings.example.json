@@ -1,0 +1,17 @@
+{
+  "schema_version": 3,
+  "batch_id": "example-batch",
+  "backend_profile": "dreamina_cli_seedance_2_5",
+  "jobs": [
+    {
+      "id": "V001",
+      "privacy_mode": "none",
+      "references": [
+        {
+          "relative_path": "replacements/target-interior.example",
+          "semantic_name": "目标车内饰"
+        }
+      ]
+    }
+  ]
+}

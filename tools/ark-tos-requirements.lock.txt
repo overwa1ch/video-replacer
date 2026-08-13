@@ -1,0 +1,3 @@
+# Runtime dependency for the optional Volcengine Ark/TOS adapter.
+# The adapter imports it only after an explicit --confirm-paid guard.
+tos==2.9.2

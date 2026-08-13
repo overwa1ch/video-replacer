@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "project_root": "..",
+  "loop_root": "../workspace/video-loop",
+  "engine": {
+    "script": "video_batch_loop.py"
+  },
+  "limits": {
+    "max_batch_videos": 15,
+    "min_free_gib": 10,
+    "daily_paid_limit": 1
+  },
+  "watch": {
+    "interval_seconds": 5,
+    "stable_seconds": 10,
+    "max_consecutive_failures": 5
+  },
+  "concurrency": {
+    "preparation": 3,
+    "generation": 2
+  }
+}

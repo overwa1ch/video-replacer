@@ -1,0 +1,5 @@
+Video Replacer
+Copyright 2026 Deco
+
+This repository contains the Video Replacer workflow under the Apache License 2.0.
+OpenScrub, imageio-ffmpeg, the Volcengine TOS SDK, OpenAI Codex CLI, and the official Dreamina CLI remain external dependencies under their own terms. See THIRD_PARTY_NOTICES.md.

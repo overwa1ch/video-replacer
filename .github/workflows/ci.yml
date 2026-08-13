@@ -1,0 +1,115 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements-core.lock.txt
+            tools/privacy/openscrub-requirements.lock.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Windows installer propagates bootstrap failure
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $fixtureRoot = Join-Path $env:RUNNER_TEMP '视频 替换 repo'
+          $fixtureTools = Join-Path $fixtureRoot 'tools'
+          New-Item -ItemType Directory -Path $fixtureTools -Force | Out-Null
+          Copy-Item -LiteralPath .\install.cmd -Destination (Join-Path $fixtureRoot 'install.cmd')
+          'raise SystemExit(23)' | Set-Content -LiteralPath (Join-Path $fixtureTools 'bootstrap.py') -Encoding ascii
+          $env:VIDEO_REPLACER_BOOTSTRAP_PYTHON = (Get-Command python.exe -ErrorAction Stop).Source
+          & (Join-Path $fixtureRoot 'install.cmd')
+          $result = $LASTEXITCODE
+          Remove-Item Env:VIDEO_REPLACER_BOOTSTRAP_PYTHON
+          if ($result -ne 23) { throw "install.cmd swallowed bootstrap exit code: $result" }
+      - name: Bootstrap clean clone (POSIX entrypoint)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: ./install
+      - name: Bootstrap clean clone with mosaic (native Windows entrypoint)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & .\install.cmd --with-mosaic
+          if ($LASTEXITCODE -ne 0) { throw "install.cmd failed with exit code $LASTEXITCODE" }
+      - name: Verify pinned Dreamina Windows artifact and upstream availability (no login, no task)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & .\.venv\Scripts\python.exe .\tools\install_dreamina.py
+          if ($LASTEXITCODE -ne 0) { throw "install_dreamina.py failed with exit code $LASTEXITCODE" }
+          & .\.video-replacer\bin\dreamina.exe version
+          if ($LASTEXITCODE -ne 0) { throw "pinned Dreamina Windows binary version check failed" }
+      - name: Install pinned official native Codex for zero-tool wire attestation
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $scriptPath = Join-Path $env:RUNNER_TEMP 'openai-codex-install-0.147.0.ps1'
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://raw.githubusercontent.com/openai/codex/rust-v0.147.0/scripts/install/install.ps1' -OutFile $scriptPath
+          $actual = (Get-FileHash -LiteralPath $scriptPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expected = '391f247de2c70c7e99041979ec02dae7e76be27ac9cfc1dfe7c1eb21d48d8b97'
+          if ($actual -ne $expected) { throw "pinned OpenAI Codex installer SHA-256 mismatch: $actual" }
+          $env:CODEX_NON_INTERACTIVE = '1'
+          & $scriptPath -Release '0.147.0'
+          if ($LASTEXITCODE -ne 0) { throw "official Codex installer failed with exit code $LASTEXITCODE" }
+          $codex = (Get-Command codex.exe -ErrorAction Stop).Source
+          $env:CODEX_ARTIFACT_UNDER_TEST = $codex
+          $verifiedJson = & .\.venv\Scripts\python.exe -c "import json,os; from pathlib import Path; from tools.codex_artifact import verify_windows_codex; result=verify_windows_codex(Path(os.environ['CODEX_ARTIFACT_UNDER_TEST'])); print(json.dumps({'binary':result['binary'],'version':result['version'],'sha256':result['sha256']}))"
+          if ($LASTEXITCODE -ne 0) { throw 'official Codex package/release provenance check failed' }
+          $verified = $verifiedJson | ConvertFrom-Json
+          $codex = [string]$verified.binary
+          if ([string]::IsNullOrWhiteSpace($codex)) { throw 'official Codex verifier returned no canonical binary' }
+          & $codex --version
+          if ($LASTEXITCODE -ne 0) { throw 'official native codex.exe version check failed' }
+          "CODEX_BINARY=$codex" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "VIDEO_REPLACER_REQUIRE_CODEX_WIRE_ATTESTATION=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Runtime smoke test (POSIX entrypoint)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          ./video-replacer status --json
+          test -d workspace/video-loop/inbox
+          test -d outputs/video-replacements
+          if ./video-replacer setup status --json; then exit 1; fi
+          if ./video-replacer once; then exit 1; fi
+      - name: Runtime smoke test (native Windows entrypoint)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & .\video-replacer.cmd status --json
+          if ($LASTEXITCODE -ne 0) { throw "video-replacer.cmd status failed" }
+          if (-not (Test-Path -LiteralPath 'workspace\video-loop\inbox' -PathType Container)) { throw 'runtime inbox missing' }
+          if (-not (Test-Path -LiteralPath 'outputs\video-replacements' -PathType Container)) { throw 'output directory missing' }
+          & .\video-replacer.cmd setup status --json
+          if ($LASTEXITCODE -eq 0) { throw 'setup status unexpectedly passed without a verified record' }
+          & .\video-replacer.cmd once
+          if ($LASTEXITCODE -eq 0) { throw 'task command unexpectedly passed before READY' }
+      - name: Test and release audit (POSIX entrypoint)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: ./video-replacer-test
+      - name: Test and release audit (native Windows entrypoint)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & .\video-replacer-test.cmd
+          if ($LASTEXITCODE -ne 0) { throw "video-replacer-test.cmd failed with exit code $LASTEXITCODE" }
