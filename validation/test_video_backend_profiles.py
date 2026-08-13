@@ -102,7 +102,10 @@ class BackendProfileWorkflowTests(unittest.TestCase):
             "VIDEO_REPLACER_ARK_SEEDANCE_2_5_MODEL_ID": "model-test",
         }
         dreamina = loop.get_backend_profile("dreamina_cli_seedance_2_5")
-        with mock.patch.dict(os.environ, source, clear=True):
+        ffmpeg = Path(self.temporary.name) / "ffmpeg-test"
+        with mock.patch.dict(os.environ, source, clear=True), mock.patch.object(
+            loop, "_trusted_ffmpeg_executable", return_value=ffmpeg
+        ):
             environment = loop.execution_environment_for_profile(dreamina, state)
         self.assertEqual(environment["PATH"], os.defpath)
         self.assertEqual(environment["VIDEO_REPLACER_STATE_DIR"], str(state))
@@ -116,7 +119,9 @@ class BackendProfileWorkflowTests(unittest.TestCase):
             self.assertNotIn(forbidden, environment)
 
         ark = loop.get_backend_profile("volcengine_ark_seedance_2_5")
-        with mock.patch.dict(os.environ, source, clear=True):
+        with mock.patch.dict(os.environ, source, clear=True), mock.patch.object(
+            loop, "_trusted_ffmpeg_executable", return_value=ffmpeg
+        ):
             execution = loop.execution_environment_for_profile(ark, state)
             probe = loop.probe_environment_for_profile(ark)
         self.assertEqual(execution["VIDEO_REPLACER_ARK_API_KEY"], "ark-secret")

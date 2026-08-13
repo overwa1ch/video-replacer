@@ -702,7 +702,7 @@ def build_batch_index(
             {
                 "id": f"V{position:03d}",
                 "filename": video.name,
-                "relative_path": str(video.relative_to(batch)),
+                "relative_path": video.relative_to(batch).as_posix(),
                 "size_bytes": video.stat().st_size,
                 "sha256": sha256_file(video),
             }
@@ -734,7 +734,7 @@ def build_reference_index(batch: Path) -> Dict[str, object]:
             {
                 "id": f"R{position:03d}",
                 "filename": reference.name,
-                "relative_path": str(reference.relative_to(batch)),
+                "relative_path": reference.relative_to(batch).as_posix(),
                 "size_bytes": reference.stat().st_size,
                 "sha256": sha256_file(reference),
             }
@@ -2033,6 +2033,8 @@ def build_codex_command(
             "token_budget",
             "--disable",
             "tool_call_mcp_elicitation",
+            "--disable",
+            "use_agent_identity",
         ]
     )
     for image_path in image_paths:

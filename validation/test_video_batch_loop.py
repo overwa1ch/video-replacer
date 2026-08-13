@@ -93,9 +93,11 @@ class VideoBatchLoopTest(unittest.TestCase):
             [
                 os.environ.get("COMSPEC", "cmd.exe"),
                 "/d",
-                "/s",
                 "/c",
-                f'mklink /J "{junction}" "{external}"',
+                "mklink",
+                "/J",
+                str(junction),
+                str(external),
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -437,7 +439,7 @@ class VideoBatchLoopTest(unittest.TestCase):
         isolated_workspace = self.temp / "isolated-node"
         isolated_workspace.mkdir()
         command = loop.build_codex_command(
-            "codex-test",
+            "codex-test.exe" if os.name == "nt" else "codex-test",
             batch,
             self.project,
             SCHEMA_PATH,
@@ -494,7 +496,15 @@ class VideoBatchLoopTest(unittest.TestCase):
 
         state_dir = self.temp / "external-node-state"
         codex_home = self.codex_node_home(state_dir)
-        with mock.patch.object(loop, "find_codex", return_value="codex-test"), mock.patch.object(
+        with mock.patch.object(
+            loop,
+            "find_codex",
+            return_value="codex-test.exe" if os.name == "nt" else "codex-test",
+        ), mock.patch.object(
+            loop,
+            "verify_windows_codex",
+            return_value={"binary": Path("codex-test.exe")},
+        ), mock.patch.object(
             loop, "executor_state_dir", return_value=state_dir
         ), mock.patch.object(
             loop, "validate_node_home", return_value=codex_home
@@ -598,7 +608,13 @@ class VideoBatchLoopTest(unittest.TestCase):
             raise loop.subprocess.TimeoutExpired(command, kwargs["timeout"])
 
         with mock.patch.object(
-            loop, "find_codex", return_value="codex-test"
+            loop,
+            "find_codex",
+            return_value="codex-test.exe" if os.name == "nt" else "codex-test",
+        ), mock.patch.object(
+            loop,
+            "verify_windows_codex",
+            return_value={"binary": Path("codex-test.exe")},
         ), mock.patch.object(
             loop, "executor_state_dir", return_value=state_dir
         ), mock.patch.object(
@@ -1364,6 +1380,8 @@ class VideoBatchLoopTest(unittest.TestCase):
             return SimpleNamespace(returncode=0, stdout="offline fixture\n")
 
         with mock.patch.object(
+            loop, "executor_state_dir", return_value=state_dir.resolve()
+        ), mock.patch.object(
             loop, "_reject_temporary_state_dir"
         ), mock.patch.dict(
             os.environ,

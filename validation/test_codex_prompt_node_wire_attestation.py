@@ -313,13 +313,14 @@ class CodexPromptNodeWireAttestationTest(unittest.TestCase):
             codex_home.mkdir()
             _write_fixture_auth(codex_home)
             try:
+                source_environment = dict(os.environ)
+                source_environment["OPENAI_API_KEY"] = (
+                    "fixture-fallback-must-not-be-used"
+                )
                 report = attest_prompt_node_file_auth(
                     binary,
                     codex_home,
-                    source_environment={
-                        "OPENAI_API_KEY": "fixture-fallback-must-not-be-used",
-                        "PATH": os.environ.get("PATH", ""),
-                    },
+                    source_environment=source_environment,
                 )
             except CodexWireAttestationError as exc:
                 self.fail(str(exc))

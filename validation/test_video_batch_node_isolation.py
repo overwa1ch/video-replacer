@@ -228,6 +228,8 @@ class VideoBatchNodeIsolationTest(unittest.TestCase):
             "codex_node_home._temporary_roots", return_value=set()
         ), mock.patch(
             "codex_node_home.path_contains_link_like", return_value=False
+        ), mock.patch(
+            "codex_node_home._windows_verify_private_acl", return_value=None
         ):
             self.assertEqual(
                 loop.validate_node_home(
@@ -244,6 +246,8 @@ class VideoBatchNodeIsolationTest(unittest.TestCase):
             "codex_node_home._temporary_roots", return_value=set()
         ), mock.patch(
             "codex_node_home.path_contains_link_like", return_value=False
+        ), mock.patch(
+            "codex_node_home._windows_verify_private_acl", return_value=None
         ), self.assertRaisesRegex(loop.CodexNodeHomeError, "forbidden"):
             loop.validate_node_home(
                 destination,
@@ -466,7 +470,7 @@ class VideoBatchNodeIsolationTest(unittest.TestCase):
         isolated_cwd = self.temp / "isolated-node-cwd"
         isolated_cwd.mkdir()
         command = loop.build_codex_command(
-            "codex-test",
+            "codex-test.exe",
             batch,
             self.project_root,
             TOOLS_ROOT / "video_batch_node_result.schema.json",
@@ -494,6 +498,7 @@ class VideoBatchNodeIsolationTest(unittest.TestCase):
                 "unified_exec",
                 "shell_snapshot",
                 "computer_use",
+                "use_agent_identity",
             }.issubset(disabled)
         )
         self.assertIn("--ignore-user-config", command)
@@ -516,7 +521,7 @@ class VideoBatchNodeIsolationTest(unittest.TestCase):
         )
         with self.assertRaises(loop.LoopError):
             loop.build_codex_command(
-                "codex-test",
+                "codex-test.exe",
                 batch,
                 self.project_root,
                 TOOLS_ROOT / "video_batch_node_result.schema.json",
@@ -533,7 +538,7 @@ class VideoBatchNodeIsolationTest(unittest.TestCase):
         image_path.parent.mkdir(parents=True)
         image_path.write_bytes(b"image-fixture")
         command = loop.build_codex_command(
-            "codex-test",
+            "codex-test.exe",
             batch,
             self.project_root,
             TOOLS_ROOT / "video_batch_node_result.schema.json",
@@ -548,7 +553,7 @@ class VideoBatchNodeIsolationTest(unittest.TestCase):
         outside.write_bytes(b"outside")
         with self.assertRaisesRegex(loop.LoopError, "节点图片越过工作区"):
             loop.build_codex_command(
-                "codex-test",
+                "codex-test.exe",
                 batch,
                 self.project_root,
                 TOOLS_ROOT / "video_batch_node_result.schema.json",
