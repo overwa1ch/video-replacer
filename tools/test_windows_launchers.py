@@ -118,6 +118,8 @@ class WindowsLauncherTests(unittest.TestCase):
         self.assertIn("'视频 替换 repo'", workflow)
         self.assertIn("Get-Command python.exe", workflow)
         self.assertIn("'raise SystemExit(23)'", workflow)
+        self.assertIn("Start-Process -FilePath $env:ComSpec", workflow)
+        self.assertIn("$result = $child.ExitCode", workflow)
         self.assertNotIn("video-replacer-fake-python.cmd", workflow)
 
 

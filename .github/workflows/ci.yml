@@ -37,8 +37,9 @@ jobs:
           Copy-Item -LiteralPath .\install.cmd -Destination (Join-Path $fixtureRoot 'install.cmd')
           'raise SystemExit(23)' | Set-Content -LiteralPath (Join-Path $fixtureTools 'bootstrap.py') -Encoding ascii
           $env:VIDEO_REPLACER_BOOTSTRAP_PYTHON = (Get-Command python.exe -ErrorAction Stop).Source
-          & (Join-Path $fixtureRoot 'install.cmd')
-          $result = $LASTEXITCODE
+          $fixtureCommand = Join-Path $fixtureRoot 'install.cmd'
+          $child = Start-Process -FilePath $env:ComSpec -ArgumentList '/D', '/S', '/C', ('call "' + $fixtureCommand + '"') -Wait -PassThru -NoNewWindow
+          $result = $child.ExitCode
           Remove-Item Env:VIDEO_REPLACER_BOOTSTRAP_PYTHON
           if ($result -ne 23) { throw "install.cmd swallowed bootstrap exit code: $result" }
       - name: Bootstrap clean clone (POSIX entrypoint)
