@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -65,7 +65,7 @@ async function writeProfileManagedPreparedJob(paths, batch, jobId) {
     paths.projectRoot,
     "outputs",
     "video-replacements",
-    `${batch.split("/").at(-1)}-${jobId}`,
+    `${basename(batch)}-${jobId}`,
   );
   await mkdir(outputDir, { recursive: true });
   const finalVideo = join(outputDir, "source-upload-ready.mp4");
@@ -94,7 +94,7 @@ async function writeProfileManagedPreparedJob(paths, batch, jobId) {
     join(outputDir, "submission-plan.json"),
     JSON.stringify({
       schema_version: 2,
-      batch_id: batch.split("/").at(-1),
+      batch_id: basename(batch),
       job_id: jobId,
       backend_profile: "dreamina_cli_seedance_2_5",
       backend_profile_constraints_sha256: "a".repeat(64),
@@ -138,8 +138,14 @@ test("an explicit project root relocates runtime but not the repository-owned en
     "status",
   ]);
   assert.equal(options.projectRoot, paths.projectRoot);
-  assert.match(options.engine, /tools\/video_batch_loop\.py$/);
-  assert.equal(options.engine.includes(`${paths.projectRoot}/tools/`), false);
+  assert.equal(
+    options.engine,
+    join(TEST_REPO_ROOT, "tools", "video_batch_loop.py"),
+  );
+  assert.notEqual(
+    options.engine,
+    join(paths.projectRoot, "tools", "video_batch_loop.py"),
+  );
   assert.equal(options.loopRoot, join(paths.projectRoot, "workspace", "video-loop"));
 });
 
