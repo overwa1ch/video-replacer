@@ -123,7 +123,7 @@ class VideoBatchNodeIsolationTest(unittest.TestCase):
         )
         (batch / "requirements.txt").write_text(
             "默认：保持原时长\n"
-            "V001：替换 Ford Escape 内饰，绑定 replacements/escape-interior.png\n"
+            "V001：替换 Ford Escape 内饰，使用@图片1作为目标内饰参考\n"
             "V002：OTHER_JOB_REQUIREMENT_SENTINEL\n",
             encoding="utf-8",
         )
@@ -313,7 +313,7 @@ class VideoBatchNodeIsolationTest(unittest.TestCase):
             payload["requirements"],
             [
                 "默认：保持原时长",
-                "V001：替换 Ford Escape 内饰，绑定 replacements/escape-interior.png",
+                "V001：替换 Ford Escape 内饰，使用@图片1作为目标内饰参考",
             ],
         )
         self.assertEqual(
@@ -564,12 +564,15 @@ class VideoBatchNodeIsolationTest(unittest.TestCase):
 
     def test_parent_promotes_structured_prompt_result_to_prompt_txt(self):
         batch = self._prepared_batch()
+        references = loop.select_job_reference_records(batch, "V001")
         prompt = (
             "素材绑定：@视频1=原视频；@图片1=车内饰。\n\n"
             "镜头1（0.0-1.0s）\n替换为车内饰。\n"
         )
 
-        loop.promote_prompt_result(batch, self.project_root, "V001", prompt)
+        loop.promote_prompt_result(
+            batch, self.project_root, "V001", references, prompt
+        )
 
         output_dir = loop.job_output_dir(self.project_root, batch, "V001")
         self.assertEqual(
@@ -577,16 +580,26 @@ class VideoBatchNodeIsolationTest(unittest.TestCase):
         )
         self.assertFalse((output_dir / "source-analysis.json").exists())
         self.assertFalse((output_dir / "reference-analysis.json").exists())
-        self.assertEqual((output_dir / "prompt.txt").read_text(), prompt)
+        persisted = (output_dir / "prompt.txt").read_text()
+        self.assertEqual(
+            persisted,
+            loop.compose_execution_prompt(batch, "V001", references, prompt) + "\n",
+        )
+        self.assertIn("- 保持原时长", persisted)
+        self.assertIn(
+            "- 替换 Ford Escape 内饰，使用车内饰作为目标内饰参考",
+            persisted,
+        )
 
     def test_parent_rejects_empty_or_non_string_prompt_result(self):
         batch = self._prepared_batch()
+        references = loop.select_job_reference_records(batch, "V001")
         for invalid in (None, "", "   \n"):
             with self.subTest(invalid=invalid), self.assertRaisesRegex(
                 loop.LoopError, "提示词交付为空"
             ):
                 loop.promote_prompt_result(
-                    batch, self.project_root, "V001", invalid
+                    batch, self.project_root, "V001", references, invalid
                 )
 
     def test_video_to_prompt_runtime_stages_samples_for_read_only_model_turn(self):

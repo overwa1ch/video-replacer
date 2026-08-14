@@ -106,8 +106,11 @@ ASSEMBLING_PREFIX = ".assembling-"
 PROMPT_FILENAME = "prompt.txt"
 REFERENCE_BINDING_FILENAME = "reference-binding.json"
 JOB_BINDINGS_FILENAME = "job-bindings.json"
-PROMPT_PIPELINE_VERSION = "video-to-prompt-v2-sampled-readonly"
-RETIRED_PROMPT_PIPELINE_VERSIONS = {"video-to-prompt-v1"}
+PROMPT_PIPELINE_VERSION = "video-to-prompt-v3-parent-composed"
+RETIRED_PROMPT_PIPELINE_VERSIONS = {
+    "video-to-prompt-v1",
+    "video-to-prompt-v2-sampled-readonly",
+}
 VIDEO_TO_PROMPT_MODEL = "gpt-5.6-terra"
 ACTIVE_VIDEO_COPY_FILENAME = "source-active.mp4"
 UPLOAD_PREPARATION_FILENAME = "upload-preparation.json"
@@ -126,6 +129,13 @@ WINDOWS_RESERVED_BASENAMES = {
 NODE_CONTRACT_ROOT = SCRIPT_ROOT / "video-replacement-node-contracts"
 VIDEO_TO_PROMPT_MODEL_CATALOG = SCRIPT_ROOT / "video-to-prompt-model-catalog.json"
 PROMPT_GATE_ERROR_PREFIX = "提示词格式 Gate 未通过："
+IMMUTABLE_REQUIREMENTS_HEADER = "最高优先级用户要求（父层固定，逐项执行）："
+NODE_EXECUTION_HEADER = "模型生成的逐镜执行说明："
+PROMPT_RESERVED_SECTION_MARKERS = (
+    "素材绑定：",
+    IMMUTABLE_REQUIREMENTS_HEADER,
+    NODE_EXECUTION_HEADER,
+)
 PRIVACY_MODES = {"none", "mosaic_required"}
 FACE_MOSAIC_SCRIPT = SCRIPT_ROOT / "privacy" / "face_mosaic.py"
 
@@ -1297,11 +1307,8 @@ def _reference_semantic_name(
     )
     base = re.sub(r"[\r\n；;_/\\]+", " ", base).strip()
     name = base
-    if name in used:
-        number = 2
-        while f"{base}（第{number}张）" in used:
-            number += 1
-        name = f"{base}（第{number}张）"
+    if any(name in existing or existing in name for existing in used):
+        raise LoopError("旧素材分类产生重复或重叠名称；请改用显式素材绑定")
     used.add(name)
     return name
 
@@ -1312,7 +1319,11 @@ def _binding_semantic_name(value: object, job_id: str) -> str:
         raise LoopError(f"{job_id} 的素材语义名称长度无效")
     if name == "原视频":
         raise LoopError(f"{job_id} 的参考素材名称不能与原视频重名")
-    if re.search(r"[\r\n；;@/\\]", name):
+    if (
+        len(name.splitlines()) != 1
+        or re.search(r"[；;。:=：@/\\]", name)
+        or any(marker in name for marker in PROMPT_RESERVED_SECTION_MARKERS)
+    ):
         raise LoopError(f"{job_id} 的素材语义名称必须是自然名词短语")
     if re.search(r"\.(?:png|jpe?g|webp|gif|bmp|tiff?)$", name, re.IGNORECASE):
         raise LoopError(f"{job_id} 的素材语义名称不能是文件名")
@@ -1460,6 +1471,13 @@ def validate_job_bindings(
             )
             if semantic_name in used_names:
                 raise LoopError(f"{job_id} 的素材语义名称必须互不重复")
+            if any(
+                semantic_name in existing or existing in semantic_name
+                for existing in used_names
+            ):
+                raise LoopError(
+                    f"{job_id} 的素材语义名称不能互为完整子串"
+                )
             used_paths.add(relative_text)
             used_names.add(semantic_name)
             indexed["semantic_name"] = semantic_name
@@ -2143,14 +2161,152 @@ def codex_subprocess_environment(
     return result
 
 
-def promote_prompt_result(
-    batch: Path, project_root: Path, job_id: str, prompt: object
-) -> None:
-    """Persist a schema-validated final prompt using parent-owned I/O."""
+def _canonical_material_binding_line(
+    references: Sequence[Mapping[str, object]],
+) -> str:
+    mappings = ["@视频1=原视频"]
+    for index, item in enumerate(references, start=1):
+        semantic_name = str(item.get("semantic_name") or "").strip()
+        if not semantic_name:
+            raise LoopError(f"@图片{index} 缺少父层语义名称")
+        mappings.append(f"@图片{index}={semantic_name}")
+    return "素材绑定：" + "；".join(mappings) + "。"
 
-    prompt_text = prompt.strip() if isinstance(prompt, str) else ""
+
+def _requirement_body(line: str, job_id: str) -> str:
+    default_match = DEFAULT_RULE_RE.match(line)
+    if default_match:
+        return default_match.group(1).split("#", 1)[0].strip()
+    parts = re.split(r"[:：]", line, maxsplit=1)
+    if len(parts) != 2 or job_id not in expand_video_ids(parts[0]):
+        raise LoopError(f"{job_id} 的父层需求行无法解析")
+    return parts[1].split("#", 1)[0].strip()
+
+
+def _canonical_requirement_lines(
+    batch: Path,
+    job_id: str,
+    references: Sequence[Mapping[str, object]],
+) -> List[str]:
+    semantic_names = [
+        str(item.get("semantic_name") or "").strip() for item in references
+    ]
+
+    def replace_handle(match: re.Match[str]) -> str:
+        kind = match.group(1)
+        index = int(match.group(2))
+        if kind == "视频":
+            if index != 1:
+                raise LoopError(f"{job_id} 的需求引用了未知素材 @视频{index}")
+            return "原视频"
+        if not 1 <= index <= len(semantic_names):
+            raise LoopError(f"{job_id} 的需求引用了未绑定素材 @图片{index}")
+        return semantic_names[index - 1]
+
+    rendered: List[str] = []
+    used_reference_handles: Set[int] = set()
+    for line in job_requirement_lines(batch, job_id):
+        body = _requirement_body(line, job_id)
+        used_reference_handles.update(
+            int(value) for value in re.findall(r"@图片(\d+)", body)
+        )
+        body = re.sub(r"@(视频|图片)(\d+)", replace_handle, body)
+        if body:
+            rendered.append(body)
+    missing_handles = sorted(
+        set(range(1, len(semantic_names) + 1)) - used_reference_handles
+    )
+    if missing_handles:
+        raise LoopError(
+            f"{job_id} 的需求必须明确说明每张绑定素材的用途，缺少："
+            + "、".join(f"@图片{index}" for index in missing_handles)
+        )
+    if not rendered:
+        raise LoopError(f"{job_id} 缺少可写入执行提示词的父层需求")
+    return rendered
+
+
+def validate_requirement_binding_contract(
+    batch: Path,
+    bindings: Mapping[str, Mapping[str, object]],
+) -> None:
+    """Fail before prompt generation when a bound image has no stated use."""
+
+    skipped = explicitly_skipped_ids(batch)
+    for job_id, binding in bindings.items():
+        if job_id in skipped:
+            continue
+        references = binding.get("references")
+        if not isinstance(references, list):
+            raise LoopError(f"{job_id} 的 references 无效")
+        _canonical_requirement_lines(
+            batch,
+            job_id,
+            [dict(item) for item in references if isinstance(item, dict)],
+        )
+
+
+def compose_execution_prompt(
+    batch: Path,
+    job_id: str,
+    references: Sequence[Mapping[str, object]],
+    node_prompt: object,
+) -> str:
+    """Compose binding and immutable requirements around node-authored prose."""
+
+    prompt_text = node_prompt.strip() if isinstance(node_prompt, str) else ""
     if not prompt_text:
         raise LoopError(f"{job_id} 提示词交付为空")
+    lines = prompt_text.splitlines()
+    first_nonempty = next(
+        (index for index, line in enumerate(lines) if line.strip()), None
+    )
+    if first_nonempty is not None and lines[first_nonempty].strip().startswith(
+        "素材绑定："
+    ):
+        del lines[first_nonempty]
+    node_body = "\n".join(lines).strip()
+    if not node_body:
+        raise LoopError(f"{job_id} 提示词只有素材绑定，缺少逐镜执行说明")
+    if any(marker in node_body for marker in PROMPT_RESERVED_SECTION_MARKERS):
+        raise LoopError(f"{job_id} 模型逐镜说明不得重复父层保留区块标题")
+    semantic_names = [
+        str(item.get("semantic_name") or "").strip() for item in references
+    ]
+    missing_names = [
+        name for name in semantic_names if name and name not in node_body
+    ]
+    if missing_names:
+        raise LoopError(
+            f"{job_id} 模型逐镜说明未实际使用全部父层素材，缺少："
+            + "、".join(missing_names)
+        )
+    requirement_block = [
+        IMMUTABLE_REQUIREMENTS_HEADER,
+        *[
+            f"- {line}"
+            for line in _canonical_requirement_lines(batch, job_id, references)
+        ],
+    ]
+    parts = [
+        _canonical_material_binding_line(references),
+        "\n".join(requirement_block),
+        NODE_EXECUTION_HEADER,
+    ]
+    parts.append(node_body)
+    return "\n".join(parts).strip()
+
+
+def promote_prompt_result(
+    batch: Path,
+    project_root: Path,
+    job_id: str,
+    references: Sequence[Mapping[str, object]],
+    prompt: object,
+) -> None:
+    """Persist the parent-composed final prompt using parent-owned I/O."""
+
+    prompt_text = compose_execution_prompt(batch, job_id, references, prompt)
     output_dir = job_output_dir(project_root, batch, job_id)
     output_dir.mkdir(parents=True, exist_ok=True)
     atomic_write_text(output_dir / PROMPT_FILENAME, prompt_text + "\n")
@@ -2206,7 +2362,13 @@ def run_video_to_prompt_node(
     validated = validate_node_result(result, job_id)
     job = validated["jobs"][0]
     if isinstance(job, dict) and job.get("status") == NODE_COMPLETE_STATUS:
-        promote_prompt_result(batch, project_root, job_id, job.get("prompt"))
+        promote_prompt_result(
+            batch,
+            project_root,
+            job_id,
+            references,
+            job.get("prompt"),
+        )
     return validated
 
 
@@ -2740,7 +2902,8 @@ def _expected_input_bindings(prompt_file: Path, images: Sequence[Path]) -> Dict[
 
 
 _SHOT_HEADER_PATTERN = re.compile(
-    r"^镜头\s*\d+\s*[（(]\s*\d+\.\d-\d+\.\ds\s*[）)](?:\s*[：:]?\s*.*)?$"
+    r"^(?P<header>镜头\s*\d+\s*[（(]\s*\d+\.\d-\d+\.\ds\s*[）)])"
+    r"(?:\s*[：:]?\s*(?P<inline_body>.*))?$"
 )
 _SHOT_HEADER_PREFIX_PATTERN = re.compile(r"^镜头")
 _OVERBROAD_FALLBACK_PARTS = (
@@ -2755,12 +2918,11 @@ _OFFSCREEN_NEGATION_PATTERN = re.compile(
 
 
 def _validate_shot_writing_contract(prompt: str) -> List[str]:
-    """Check the user-approved multi-shot layout without redefining source shots.
+    """Return advisory multi-shot writing findings without redefining source shots.
 
-    Source analysis remains responsible for whether timestamps match the actual
-    source shots. This deterministic gate only ensures that a written multi-shot
-    prompt carries the agreed one-decimal header and one plain change paragraph
-    per source shot.
+    Source analysis remains responsible for source shots. Natural prompt prose
+    can express the same edit with a different heading or a user-required
+    negation, so these findings are intentionally not submission blockers.
     """
 
     lines = prompt.splitlines()
@@ -2774,17 +2936,21 @@ def _validate_shot_writing_contract(prompt: str) -> List[str]:
 
     conflicts: List[str] = []
     for header_index, (line_index, header) in enumerate(headers, start=1):
-        if not _SHOT_HEADER_PATTERN.match(header):
+        header_match = _SHOT_HEADER_PATTERN.match(header)
+        if not header_match:
             conflicts.append(
                 f"镜头{header_index}时间格式必须为“镜头N（0.0-2.5s）”，精确到0.1秒"
             )
+            continue
         next_line = (
             headers[header_index][0]
             if header_index < len(headers)
             else len(lines)
         )
-        block = "\n".join(lines[line_index:next_line])
-        body = block[len(header):].strip()
+        body_lines = lines[line_index + 1 : next_line]
+        inline_body = str(header_match.group("inline_body") or "").strip()
+        body = "\n".join([inline_body, *body_lines]).strip()
+        block = "\n".join([header, *body_lines])
         if not body:
             conflicts.append(f"镜头{header_index}缺少逐镜变更内容")
         if all(part in block for part in _OVERBROAD_FALLBACK_PARTS):
@@ -2800,15 +2966,26 @@ def _validate_shot_writing_contract(prompt: str) -> List[str]:
     return conflicts
 
 
-def _validate_reference_alias_contract(prompt: str, reference_count: int) -> List[str]:
+def _validate_reference_alias_contract(
+    prompt: str,
+    reference_count: int,
+    expected_reference_names: Optional[Sequence[str]] = None,
+    expected_requirement_lines: Optional[Sequence[str]] = None,
+) -> List[str]:
+    raw_lines = prompt.splitlines()
     nonempty_lines = [line.strip() for line in prompt.splitlines() if line.strip()]
     if not nonempty_lines or not nonempty_lines[0].startswith("素材绑定："):
         return ["首个非空行必须是完整的素材绑定"]
 
     binding_line = nonempty_lines[0]
     conflicts: List[str] = []
-    if re.findall(r"@视频1(?!\d)", binding_line) != ["@视频1"]:
-        conflicts.append("@视频1必须在素材绑定行恰好出现一次")
+    video_mappings = re.findall(
+        r"@视频([0-9]+)\s*=\s*([^；。\n]+)", binding_line
+    )
+    if [(int(index), name.strip()) for index, name in video_mappings] != [
+        (1, "原视频")
+    ]:
+        conflicts.append("素材绑定行必须且只能声明 @视频1=原视频")
     expected_handles = list(range(1, reference_count + 1))
     mappings = re.findall(r"@图片([0-9]+)\s*=\s*([^；。\n]+)", binding_line)
     mapping_indexes = [int(index) for index, _ in mappings]
@@ -2825,12 +3002,80 @@ def _validate_reference_alias_contract(prompt: str, reference_count: int) -> Lis
     body_lines = nonempty_lines[1:]
     if any(re.search(r"@(?:视频[0-9]+|图片[0-9]+)", line) for line in body_lines):
         conflicts.append("素材句柄只能出现在首行素材绑定；正文必须直接使用对应名称")
-    conflicts.extend(_validate_shot_writing_contract(prompt))
+    if expected_reference_names is not None:
+        expected_names = [str(name).strip() for name in expected_reference_names]
+        if semantic_names != expected_names:
+            conflicts.append("素材绑定名称必须逐项等于父层登记的有序语义名称")
+        expected_binding = "素材绑定：" + "；".join(
+            ["@视频1=原视频"]
+            + [
+                f"@图片{index}={name}"
+                for index, name in enumerate(expected_names, start=1)
+            ]
+        ) + "。"
+        if binding_line != expected_binding:
+            conflicts.append("素材绑定首行必须逐字等于父层规范绑定")
+    if any(
+        first in second or second in first
+        for index, first in enumerate(semantic_names)
+        for second in semantic_names[index + 1 :]
+    ):
+        conflicts.append("素材绑定名称不能互为完整子串")
+    semantic_body_lines = body_lines
+    if expected_requirement_lines is not None:
+        expected_body_prefix = [
+            IMMUTABLE_REQUIREMENTS_HEADER,
+            *[f"- {line}" for line in expected_requirement_lines],
+            NODE_EXECUTION_HEADER,
+        ]
+        expected_full_prefix = [
+            (
+                "素材绑定："
+                + "；".join(
+                    ["@视频1=原视频"]
+                    + [
+                        f"@图片{index}={name}"
+                        for index, name in enumerate(
+                            (
+                                [str(value).strip() for value in expected_reference_names]
+                                if expected_reference_names is not None
+                                else semantic_names
+                            ),
+                            start=1,
+                        )
+                    ]
+                )
+                + "。"
+            ),
+            *expected_body_prefix,
+        ]
+        if raw_lines[: len(expected_full_prefix)] != expected_full_prefix:
+            conflicts.append("不可变用户需求块缺失、改写或顺序不一致")
+            semantic_body_lines = []
+        else:
+            semantic_body_lines = raw_lines[len(expected_full_prefix) :]
+        if not any(line.strip() for line in semantic_body_lines):
+            conflicts.append("模型生成的逐镜执行说明不能为空")
+        semantic_body = "\n".join(semantic_body_lines)
+        if any(
+            marker in semantic_body for marker in PROMPT_RESERVED_SECTION_MARKERS
+        ):
+            conflicts.append("模型逐镜说明不得重复父层保留区块标题")
+    body = "\n".join(semantic_body_lines)
+    missing_names = [name for name in semantic_names if name and name not in body]
+    if missing_names:
+        conflicts.append(
+            "正文必须实际使用每个已绑定的素材名称，缺少："
+            + "、".join(missing_names)
+        )
     return conflicts
 
 
 def validate_execution_prompt(
-    prompt_file: Path, reference_count: Optional[int] = None
+    prompt_file: Path,
+    reference_count: Optional[int] = None,
+    expected_reference_names: Optional[Sequence[str]] = None,
+    expected_requirement_lines: Optional[Sequence[str]] = None,
 ) -> None:
     try:
         prompt = prompt_file.read_text(encoding="utf-8").strip()
@@ -2839,9 +3084,19 @@ def validate_execution_prompt(
     if not prompt:
         raise LoopError("执行提示词不能为空")
 
+    if expected_reference_names is not None:
+        expected_count = len(expected_reference_names)
+        if reference_count is not None and reference_count != expected_count:
+            raise LoopError("父层参考素材数量与语义名称数量不一致")
+        reference_count = expected_count
     if reference_count is None:
         return
-    conflicts = _validate_reference_alias_contract(prompt, reference_count)
+    conflicts = _validate_reference_alias_contract(
+        prompt,
+        reference_count,
+        expected_reference_names=expected_reference_names,
+        expected_requirement_lines=expected_requirement_lines,
+    )
     if conflicts:
         raise LoopError(PROMPT_GATE_ERROR_PREFIX + "；".join(conflicts))
 
@@ -3889,8 +4144,18 @@ def load_submission_plan(
     images = value["images"]
     if not isinstance(images, list) or not 0 <= len(images) <= 9:
         raise LoopError(f"{job_id} images 必须包含 0–9 张参考图")
+    declared_references = select_job_reference_records(batch, job_id)
+    expected_reference_names = [
+        str(item.get("semantic_name") or "").strip()
+        for item in declared_references
+    ]
     validate_execution_prompt(
-        Path(str(value["prompt_file"])), reference_count=len(images)
+        Path(str(value["prompt_file"])),
+        reference_count=len(images),
+        expected_reference_names=expected_reference_names,
+        expected_requirement_lines=_canonical_requirement_lines(
+            batch, job_id, declared_references
+        ),
     )
     replacement_root = (batch / "replacements").resolve()
     indexed_paths = {
@@ -3899,6 +4164,7 @@ def load_submission_plan(
         if isinstance(item, dict)
     }
     normalized_images: List[str] = []
+    normalized_relative_images: List[str] = []
     seen_images: Set[str] = set()
     for raw_image in images:
         relative = _plan_reference_relative_path(raw_image, batch)
@@ -3912,6 +4178,12 @@ def load_submission_plan(
             raise LoopError(f"{job_id} images 含重复参考图：{relative}")
         seen_images.add(str(image))
         normalized_images.append(str(image))
+        normalized_relative_images.append(indexed_key)
+    expected_relative_images = [
+        str(item.get("relative_path") or "") for item in declared_references
+    ]
+    if normalized_relative_images != expected_relative_images:
+        raise LoopError(f"{job_id} images 必须逐项等于父层登记的有序参考素材")
     value["images"] = normalized_images
     value["output_dir"] = str(expected_output)
     preflight = validate_submission_preflight(value, executor)
@@ -5061,6 +5333,8 @@ def inspect_streaming_flow(
             raise LoopError(
                 "批次输入在 streaming job 产生后发生变化；请建立新批次，拒绝混用旧结果"
             )
+    bindings = validate_job_bindings(batch, index, reference_index)
+    validate_requirement_binding_contract(batch, bindings)
     skipped = explicitly_skipped_ids(batch)
     indexed_jobs = index["jobs"]  # type: ignore[index]
     assert isinstance(indexed_jobs, list)
@@ -5156,6 +5430,8 @@ def verify_streaming_flow(
         )
     if flow.get("flow_fingerprint") != current_fingerprint:
         raise LoopError("streaming flow 输入哈希已变化；拒绝继续")
+    bindings = validate_job_bindings(batch, index, reference_index)
+    validate_requirement_binding_contract(batch, bindings)
     return flow
 
 
@@ -5303,7 +5579,17 @@ def prepare_streaming_job(
                 # This deterministic gate is the final prompt checkpoint
                 # before preview or any paid-capable action. A failed prompt
                 # blocks locally.
-                validate_execution_prompt(prompt_file, reference_count=len(images))
+                validate_execution_prompt(
+                    prompt_file,
+                    reference_count=len(images),
+                    expected_reference_names=[
+                        str(item.get("semantic_name") or "").strip()
+                        for item in references
+                    ],
+                    expected_requirement_lines=_canonical_requirement_lines(
+                        batch, job_id, references
+                    ),
+                )
                 active_video = (
                     prepare_mosaic_video(batch, project_root, job_id)
                     if privacy_mode == "mosaic_required"
@@ -6732,9 +7018,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print(loop_root / state)
             return 0
         if args.command == "check":
-            errors, coverage = validate_requirements(
-                locate_batch(loop_root, args.batch)
-            )
+            batch = locate_batch(loop_root, args.batch)
+            errors, coverage = validate_requirements(batch)
+            if not errors:
+                try:
+                    index, reference_index = verify_batch_integrity(
+                        batch, max_batch_videos=args.max_batch_videos
+                    )
+                    bindings = validate_job_bindings(
+                        batch, index, reference_index
+                    )
+                    validate_requirement_binding_contract(batch, bindings)
+                except LoopError as exc:
+                    errors.append(str(exc))
             print(json.dumps({"errors": errors, "coverage": coverage}, ensure_ascii=False, indent=2))
             return 1 if errors else 0
         if args.command == "cleanup-node-runs":

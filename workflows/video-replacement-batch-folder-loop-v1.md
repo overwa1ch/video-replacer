@@ -17,7 +17,7 @@ updated: 2026-08-13
 → Skill 从 READY record 读取 backend_profile，整理 schema-v3 批次与每个 Job 的 privacy_mode
 → 父流程用本地 FFmpeg 对当前源片做有界、带时间戳抽帧
 → 无执行/文件系统工具的 Video-to-Prompt 回合只接收抽帧、绑定参考图和结构化 JSON
-→ 回合返回结构化提示词字符串，父流程校验后写 `prompt.txt`
+→ 回合返回结构化提示词字符串，父流程重建规范素材绑定、插入不可变 Job 需求并通过语义 Gate 后写 `prompt.txt`
 → mosaic_required 时自动生成打码输入
 → 检查真正准备上传的视频，必要时做本地上传准备
 → 本地 probe 与 submission plan
@@ -28,7 +28,7 @@ updated: 2026-08-13
 → COMPLETED 或 blocked/PARTIAL
 ```
 
-确定性父流程读取当前 Job 源视频，用受信 FFmpeg 生成从开头帧起、按时间均匀分布的有界顺序抽帧，并校验时间戳、大小与 SHA-256。受支持后端的源片最长 30 秒，当前以 0.75 秒节奏取样；对异常更长输入，有界策略也会把帧均匀分布在全程，而不是只消耗在片头。源视频本身不附加给 Codex 回合。回合只接收父层附加的抽帧、有序参考图和结构化 Job JSON，在一次模型调用中完成观察与提示词写作。它不写文件；父流程校验返回的结构化字符串后才持久化 `prompt.txt`。不会产生中间分析产物交给第二个模型，也不创建画面质量审查、隐私效果复核或生成结果审查任务。
+确定性父流程读取当前 Job 源视频，用受信 FFmpeg 生成从开头帧起、按时间均匀分布的有界顺序抽帧，并校验时间戳、大小与 SHA-256。受支持后端的源片最长 30 秒，当前以 0.75 秒节奏取样；对异常更长输入，有界策略也会把帧均匀分布在全程，而不是只消耗在片头。源视频本身不附加给 Codex 回合。回合只接收父层附加的抽帧、有序参考图和结构化 Job JSON，在一次模型调用中完成观察与提示词写作。它不写文件；父流程用登记数据重建素材绑定，把 `requirements.txt` 中该 Job 的原始文字解析并替换素材句柄后插入最高优先级区块，再把节点内容放进独立的模型逐镜说明区，并要求所有绑定语义名称都出现在该区。该 Gate 通过后才持久化 `prompt.txt`。不会产生中间分析产物交给第二个模型，也不创建画面质量审查、隐私效果复核或生成结果审查任务。
 
 ## 路径合同
 
@@ -52,7 +52,7 @@ Git 跟踪区只保存 skill、workflow、执行器、合同和测试。批次�
 | 用户 | 首次安装时完成必要账户授权或受保护凭证输入；提供任务要求；批准当前批次的付费提交。 |
 | Project Agent + local skill | 在同一下载任务中立即安装依赖与马赛克能力、配置持久后端并取得当前 setup 合同的实时 READY；整理可信输入；按需创建参考图；从 setup record 读取受控 profile；写 schema-v3 `job-bindings.json`；调用控制面；等待；简略汇报。 |
 | JavaScript 控制面 | 命令入口、互斥、shadow 边界、当前批次付费 capability、进程等待和恢复调度。 |
-| Python 父层 | 批次索引、输入哈希、显式 `privacy_mode`、受信本地 FFmpeg 抽帧、抽帧/参考图附加、节点 Codex 进程串行化、结构化结果校验与 `prompt.txt` 持久化、自动打码、上传准备、确定性 Gate、preflight、submission plan 和任务防重。 |
+| Python 父层 | 批次索引、输入哈希、显式 `privacy_mode`、受信本地 FFmpeg 抽帧、抽帧/参考图附加、节点 Codex 进程串行化、规范绑定与不可变需求组装、素材语义覆盖校验、`prompt.txt` 持久化、自动打码、上传准备、preflight、submission plan 和任务防重。 |
 | 单个隔离回合 | 单 Job sampled Video-to-Prompt：只根据父层附加的抽帧、有序参考图和结构化 JSON 返回提示词字符串；无执行/文件系统工具，不持久化文件。 |
 | adapter registry | 将冻结 profile 绑定到审核过的即梦 CLI 或 Ark adapter；不接受批次指定的可执行文件、模型或压缩参数。 |
 
@@ -106,7 +106,7 @@ Agent 只提交 `schema_version`、`batch_id`、批次级 `backend_profile`、`j
 
 打码阶段只要求命令成功和输出文件存在。失败时当前 Job 阻塞，原片不会作为上传回退项。流程不检查命中数、画面覆盖度或打码效果。
 
-旧 schema v1/v2 或旧提示词管线只允许恢复全 Job 已完成且提交计划可验证的冻结结果；任何半成品都必须重新整理 schema v3 新批次。新 flow 绑定 `video-to-prompt-v2-sampled-readonly`、固定节点模型与当前节点合同 SHA-256，任一项变化后都拒绝续跑旧 flow。
+旧 schema v1/v2 或旧提示词管线只允许恢复全 Job 已完成且提交计划可验证的冻结结果；任何半成品都必须重新整理 schema v3 新批次。重建时逐字复制旧批次的 `requirements.txt` 和未变化绑定，禁止为了通过节点或 Gate 改写硬约束。新 flow 绑定 `video-to-prompt-v3-parent-composed`、固定节点模型与当前节点合同 SHA-256，任一项变化后都拒绝续跑旧 flow。
 
 ## 受控 profile 与本地上传准备
 

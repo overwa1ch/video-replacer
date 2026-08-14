@@ -22,6 +22,22 @@ SPEC.loader.exec_module(loop)
 
 
 class VideoBatchLoopDreaminaTests(unittest.TestCase):
+    def test_shot_writing_advisory_accepts_inline_change_paragraph(self) -> None:
+        prompt = "\n".join(
+            (
+                "镜头1（0.0-2.5s）将驾驶位人物替换为目标人物，并保持原有动作。",
+                "镜头2（2.5-5.0s）将车内饰替换为目标内饰，并保持车辆行驶状态。",
+            )
+        )
+        self.assertEqual(loop._validate_shot_writing_contract(prompt), [])
+
+    def test_shot_writing_advisory_reports_empty_heading(self) -> None:
+        prompt = "镜头1（0.0-2.5s）\n镜头2（2.5-5.0s）\n保留原有动作。"
+        self.assertEqual(
+            loop._validate_shot_writing_contract(prompt),
+            ["镜头1缺少逐镜变更内容"],
+        )
+
     def test_default_executor_is_project_dreamina_adapter(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("VIDEO_REPLACEMENT_EXECUTOR", None)
@@ -69,6 +85,9 @@ class VideoBatchLoopDreaminaTests(unittest.TestCase):
         self.assertNotIn("source-analysis.json", contract)
         self.assertNotIn("reference-analysis.json", contract)
         self.assertIn("素材绑定：@视频1=原视频；@图片1=目标对象A", contract)
+        self.assertIn("source-layout fact explicitly confirmed", contract)
+        self.assertIn("midpoint of that observed interval", contract)
+        self.assertIn("parent canonicalizes", contract)
         self.assertIn("multi-shot source", contract)
         self.assertIn("Sora", contract)
         for prompt in (video_to_prompt,):

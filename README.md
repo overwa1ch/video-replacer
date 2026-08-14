@@ -11,12 +11,13 @@ Windows 的“公开发布已验证”是独立的发布硬 Gate，不由代码�
 ## 数据与费用边界
 
 - `prepare` 先由确定性父流程用本地 FFmpeg 对当前 Job 的源视频做有界抽帧。隔离 Codex 回合只接收带时间戳抽帧、有序参考图和结构化 Job JSON；源视频本身不附加给该回合。这些图像和 JSON 会发送给用户当前配置的 OpenAI/Codex 服务。
-- 该 Codex 回合使用 `CODEX_EXEC_SERVER_URL=none`，`execution environment` 为 `none`，不注册执行或文件系统工具。它只返回结构化提示词字符串；父流程校验后才写入 `prompt.txt`。
+- 该 Codex 回合使用 `CODEX_EXEC_SERVER_URL=none`，`execution environment` 为 `none`，不注册执行或文件系统工具。它只返回结构化提示词字符串；父流程会用 `job-bindings.json` 重建规范素材绑定，将当前 Job 的原始需求文字确定性插入最高优先级区块，再把模型内容放入独立的逐镜说明区，校验每个素材名称确实进入该模型区后才写入 `prompt.txt`。
 - 提示词回合使用一个稳定的外置节点专用 `CODEX_HOME`：它固定使用经过严格 schema 校验的 file auth，不包含 `AGENTS.md`、rules、skills、plugins、MCP、hooks 或其他用户配置。首次 setup 时 Agent 通过 `setup login-codex-node` 发起该专用登录，用户只在 Codex 的受保护界面完成账号授权。Doctor 与生产回合始终使用同一个 home，不从外层 Agent 每次复制 auth。显式登录修复只会在 home 结构、安全属性和文件身份均通过检查后清除一个格式错误的普通 `auth.json`；有效 auth 保留，链接、非常规文件或不安全 home 会 fail closed。
 - 原生 Windows 的外置 state root 固定为 Known Folder API 从真实当前用户 token 解析的 `FOLDERID_LocalAppData/video-replacer`；`LOCALAPPDATA` 等环境文本不能改变它，`VIDEO_REPLACER_STATE_DIR` 只能等值重述这一 canonical path，不能重定向凭证或账本。UNC、mapped drive、non-fixed drive、reparse 路径和任意其他 override 均 fail closed。节点 home、`auth.json` 和认证锁位于该 root，三者的 owner 为当前用户，DACL 禁用继承，只保留当前用户与 `SYSTEM` 两个 full-control ACE；setup 负责加固，Doctor 和生产前重新验证。
 - `READY` 还要求同一稳定认证锁内的两阶段本机 zero-tool wire attestation。Doctor 两次都使用 exact production command、同一个节点 home、合成图片和 loopback Responses provider：第一阶段 `requires_openai_auth=false`，要求有图片、顶层/附加 tools 均空、无 multi-agent hints 且无 auth header；第二阶段 `requires_openai_auth=true`，在保持相同 zero-tool 图像 request surface 的同时捕获一次认证握手，并用内存中的 SHA-256 与 `hmac.compare_digest` 证明 Bearer 值等于严格校验后的稳定 `auth.json` `access_token`。两阶段各由 HTTP 418 立即停止，原始 token/header 不保留也不记录。它能发现 managed/system 配置把 MCP、hook、tool 或 Agent 指令重新注入实际 wire surface。
 - 所有提示词节点 Codex 进程串行执行，避免多个 Job 并发刷新或改写同一个 file-auth token store。
 - `prepare` 不向视频后端上传媒体，也不创建付费任务。
+- `READY_FOR_SUBMISSION` 同时要求技术准备、父层素材顺序以及提示词语义覆盖通过；仅在首行绑定参考图、正文没有使用该素材时会在本地阻塞。
 - `--confirm-paid submit-prepared` 会把最终上传文件发送到公开 setup 已验证的 Dreamina 后端，并可能消耗账户积分或产生费用。
 - `mosaic_required` 只是自动马赛克处理，不保证完整覆盖或不可逆匿名化。
 - 源媒体、参考图、运行状态和输出都在 Git ignore 边界内；恢复与防重账本位于仓库外的系统 state 目录。

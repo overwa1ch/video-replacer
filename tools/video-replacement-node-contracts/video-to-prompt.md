@@ -5,9 +5,11 @@
 For exactly one Job, inspect the parent's timestamped visual samples and
 parent-bound reference images, then directly return one replacement prompt in
 the required structured result. The parent extracts the samples locally from
-the source video and writes `prompt.txt` after schema validation. This is one
-continuous analysis-and-writing task: no intermediate analysis artifact is
-created or handed to another model node.
+the source video, replaces the binding line with its canonical binding, inserts
+the Job requirements as a highest-priority block, preserving their wording
+while resolving material handles, and writes `prompt.txt` after schema
+validation. This is one continuous analysis-and-writing task:
+no intermediate analysis artifact is created or handed to another model node.
 
 ## Allowed inputs
 
@@ -37,9 +39,13 @@ network services.
 3. Inspect each parent-bound reference image only for concise visible facts
    needed to identify its requested replacement target. Do not assess image
    quality, suitability, identity consistency, or any generated result.
-4. Do not infer a source fact from requirements or reference images. Do not
-   invent a user requirement. If a required distinction cannot be established
-   from the allowed inputs, return `BLOCKED` with the precise reason.
+4. Do not invent a source fact from a reference image or an unstated
+   requirement. A source-layout fact explicitly confirmed in the Job
+   requirements is authoritative input, not an inference: when sparse samples
+   do not visibly reveal that confirmed opening, middle, or ending segment,
+   retain the confirmed layout for the requested edit instead of returning
+   `BLOCKED` for that absence alone. Do not fabricate any unconfirmed shot
+   boundary, timing, action, or transition.
 
 ## Sora edit-prompt rules
 
@@ -47,13 +53,20 @@ network services.
    line: `素材绑定：@视频1=原视频；@图片1=目标对象A；@图片2=目标对象B。` Bind every
    parent-fixed handle once, in parent-fixed order. The body uses the supplied
    semantic names directly and never repeats an `@` handle. Do not add,
-   remove, rename, reorder, or reinterpret a binding.
+   remove, rename, reorder, or reinterpret a binding. Use every parent-bound
+   semantic name in the body for its requested replacement; listing a name only
+   on the binding line is incomplete.
 2. **Shot-by-shot editing.** For a multi-shot source, use the exact heading
-   `镜头N（0.0-2.5s）`, with source boundaries rounded to one decimal second.
-   Under each heading, write one plain paragraph containing the requested
-   changes and only the source facts necessary to preserve that shot. Do not
-   redefine original composition, camera, shot size, movement, timing, or
-   rhythm.
+   `镜头N（0.0-2.5s）`. When samples bracket a cut rather than reveal its
+   frame-exact position, use the midpoint of that observed interval rounded to
+   one decimal second as the prompt-only heading label. It is an estimate for
+   prompt organization, not an asserted frame-exact source fact; do not return
+   `BLOCKED` only because the sampling cadence cannot establish a 0.1-second
+   cut. Follow each heading with one plain paragraph containing the requested
+   changes and only the source facts necessary to preserve that shot. The
+   paragraph may begin on the same line after the heading or on the next line.
+   Do not redefine original composition, camera, shot size, movement, timing,
+   or rhythm.
 3. **Visible current-shot content only.** Name only what is visible in the
    current shot, explicitly requested by the user, or necessary for that
    shot's edit. Do not carry an off-screen person, product, object, clothing
@@ -76,7 +89,8 @@ shot where that character is visible or explicitly required.
 
 Return exactly the current Job in the required result schema. Put the complete
 replacement prompt in `jobs[0].prompt`; do not write a file or an analysis
-artifact. Use `COMPLETE` only when `prompt` is a non-empty string and
-`blocker` is null. Otherwise use `BLOCKED` with the exact reason and set
-`prompt` to null. The parent alone persists the validated string as
-`prompt.txt`.
+artifact. Use `COMPLETE` only when `prompt` is a non-empty string, every bound
+semantic name is used in the body, and `blocker` is null. Otherwise use
+`BLOCKED` with the exact reason and set `prompt` to null. The parent canonicalizes
+the binding, inserts the immutable requirements block, validates semantic use,
+and the parent alone persists `prompt.txt`.

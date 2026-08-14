@@ -269,7 +269,14 @@ class BackendProfileWorkflowTests(unittest.TestCase):
         )
         prompt = output / loop.PROMPT_FILENAME
         prompt.write_text(
-            "素材绑定：@视频1=原视频。\n执行指定替换。\n", encoding="utf-8"
+            loop.compose_execution_prompt(
+                batch,
+                "V001",
+                [],
+                "素材绑定：@视频1=原视频。\n执行指定替换。\n",
+            )
+            + "\n",
+            encoding="utf-8",
         )
         preflight_path = output / "preflight.json"
         executor = loop.ExecutorSpec(
