@@ -172,6 +172,7 @@ class CodexPromptNodeWireAttestationTest(unittest.TestCase):
     def test_authenticated_validator_rejects_fallback_and_mismatched_credentials(self) -> None:
         valid = _captured_request()
         valid["headers"]["authorization"] = True
+        valid["headers"]["chatgpt-account-id"] = True
         valid["authorization_count"] = 1
         valid["authorization_is_bearer"] = True
         valid["authorization_matches"] = True
@@ -202,11 +203,24 @@ class CodexPromptNodeWireAttestationTest(unittest.TestCase):
         api_key_fallback = copy.deepcopy(valid)
         api_key_fallback["headers"]["x-api-key"] = True
         malicious.append(("API key fallback", api_key_fallback))
+        actor_authorization = copy.deepcopy(valid)
+        actor_authorization["headers"]["x-openai-actor-authorization"] = True
+        malicious.append(("actor authorization fallback", actor_authorization))
         for label, request in malicious:
             with self.subTest(label=label), self.assertRaises(
                 CodexWireAttestationError
             ):
                 wire._validate_authenticated_captured_request(request)
+
+    def test_unauthenticated_validator_rejects_credentials_and_account_routing(self) -> None:
+        for header_name in sorted(wire.UNAUTHENTICATED_FORBIDDEN_HEADERS):
+            request = _captured_request()
+            request["headers"][header_name] = True
+            with self.subTest(header=header_name), self.assertRaisesRegex(
+                CodexWireAttestationError,
+                "credentials or account-routing headers",
+            ):
+                wire._validate_captured_request(request)
 
     def test_file_auth_digest_errors_never_echo_token(self) -> None:
         secret = "fixture-secret-must-never-appear"
@@ -305,6 +319,38 @@ class CodexPromptNodeWireAttestationTest(unittest.TestCase):
                 "model_inference_response_accepted": False,
             },
         )
+
+    def test_native_unauthenticated_wire_isolates_logged_file_auth(self) -> None:
+        binary = _native_codex_0147_or_newer(self)
+        with tempfile.TemporaryDirectory(prefix="codex-unauth-wire-home-") as raw:
+            codex_home = Path(raw) / "codex-home"
+            codex_home.mkdir()
+            _write_fixture_auth(codex_home)
+            auth_path = codex_home / "auth.json"
+            before_digest = hashlib.sha256(auth_path.read_bytes()).digest()
+            before_mtime_ns = auth_path.stat().st_mtime_ns
+            source_environment = dict(os.environ)
+            for credential_name in (
+                "CODEX_ACCESS_TOKEN",
+                "CODEX_API_KEY",
+                "OPENAI_API_KEY",
+            ):
+                source_environment[credential_name] = (
+                    "fixture-fallback-must-not-be-used"
+                )
+            try:
+                report = attest_prompt_node_wire(
+                    binary,
+                    codex_home,
+                    source_environment=source_environment,
+                )
+            except CodexWireAttestationError as exc:
+                self.fail(str(exc))
+            after_digest = hashlib.sha256(auth_path.read_bytes()).digest()
+            after_mtime_ns = auth_path.stat().st_mtime_ns
+        self.assertTrue(report["attested"])
+        self.assertEqual(before_digest, after_digest)
+        self.assertEqual(before_mtime_ns, after_mtime_ns)
 
     def test_native_codex_loads_file_auth_for_loopback_only(self) -> None:
         binary = _native_codex_0147_or_newer(self)
