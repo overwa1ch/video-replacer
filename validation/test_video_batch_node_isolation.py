@@ -61,6 +61,22 @@ class VideoBatchNodeIsolationTest(unittest.TestCase):
             },
         }
 
+    def _freeze_source_evidence(self, batch, analysis_tool, extractor=None):
+        loop.ensure_source_evidence_index(
+            batch,
+            loop.verify_batch_index(batch),
+            analysis_tool,
+            frame_extractor=extractor or self._fake_frame_extractor,
+        )
+        loop.atomic_write_json(
+            batch / "streaming-flow.json",
+            {
+                "source_evidence_index_sha256": loop.sha256_file(
+                    batch / loop.SOURCE_EVIDENCE_INDEX_FILENAME
+                )
+            },
+        )
+
     def _prepared_batch(self) -> Path:
         inbox_batch = self.loop_root / "inbox" / "node-isolation"
         videos = inbox_batch / "videos"
@@ -123,7 +139,7 @@ class VideoBatchNodeIsolationTest(unittest.TestCase):
         )
         (batch / "requirements.txt").write_text(
             "默认：保持原时长\n"
-            "V001：替换 Ford Escape 内饰，绑定 replacements/escape-interior.png\n"
+            "V001：替换 Ford Escape 内饰，使用@图片1作为目标内饰参考\n"
             "V002：OTHER_JOB_REQUIREMENT_SENTINEL\n",
             encoding="utf-8",
         )
@@ -262,6 +278,7 @@ class VideoBatchNodeIsolationTest(unittest.TestCase):
         analysis_tool = self.temp / "ffmpeg-fixture"
         analysis_tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         analysis_tool.chmod(0o755)
+        self._freeze_source_evidence(batch, analysis_tool)
         input_path = loop.write_video_to_prompt_node_input(
             batch,
             self.project_root,
@@ -313,7 +330,7 @@ class VideoBatchNodeIsolationTest(unittest.TestCase):
             payload["requirements"],
             [
                 "默认：保持原时长",
-                "V001：替换 Ford Escape 内饰，绑定 replacements/escape-interior.png",
+                "V001：替换 Ford Escape 内饰，使用@图片1作为目标内饰参考",
             ],
         )
         self.assertEqual(
@@ -363,12 +380,125 @@ class VideoBatchNodeIsolationTest(unittest.TestCase):
         self.assertFalse((workspace / "tools").exists())
         self.assertFalse((workspace / "inputs" / "references" / "R002.png").exists())
 
+    def test_same_source_jobs_extract_once_but_receive_independent_frame_copies(self):
+        batch = self._prepared_batch()
+        first_source = batch / "videos" / "current.mp4"
+        second_source = batch / "videos" / "other-job-secret.mp4"
+        second_source.write_bytes(first_source.read_bytes())
+        loop.atomic_write_json(batch / "batch-index.json", loop.build_batch_index(batch))
+        analysis_tool = self.temp / "ffmpeg-cache-fixture"
+        analysis_tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        analysis_tool.chmod(0o755)
+        calls = []
+
+        def extractor(source, frame_root, tool):
+            calls.append((source, tool))
+            return self._fake_frame_extractor(source, frame_root, tool)
+
+        self._freeze_source_evidence(batch, analysis_tool, extractor)
+        workspaces = []
+        for job_id in ("V001", "V002"):
+            workspace = self.temp / f"same-source-{job_id}"
+            workspaces.append(workspace)
+            loop.write_video_to_prompt_node_input(
+                batch,
+                self.project_root,
+                job_id,
+                workspace,
+                loop.select_job_reference_records(batch, job_id),
+                analysis_tool=analysis_tool,
+                frame_extractor=extractor,
+            )
+
+        self.assertEqual(len(calls), 1)
+        first_frame = workspaces[0] / "inputs" / "frames" / "frame-001.jpg"
+        second_frame = workspaces[1] / "inputs" / "frames" / "frame-001.jpg"
+        self.assertEqual(first_frame.read_bytes(), second_frame.read_bytes())
+        self.assertFalse(first_frame.is_symlink())
+        self.assertFalse(second_frame.is_symlink())
+        if os.name != "nt":
+            self.assertNotEqual(first_frame.stat().st_ino, second_frame.stat().st_ino)
+
+    def test_corrupt_source_evidence_cache_fails_closed(self):
+        batch = self._prepared_batch()
+        analysis_tool = self.temp / "ffmpeg-corrupt-cache-fixture"
+        analysis_tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        analysis_tool.chmod(0o755)
+        self._freeze_source_evidence(batch, analysis_tool)
+        loop.write_video_to_prompt_node_input(
+            batch,
+            self.project_root,
+            "V001",
+            self.temp / "source-cache-first",
+            loop.select_job_reference_records(batch, "V001"),
+            analysis_tool=analysis_tool,
+            frame_extractor=self._fake_frame_extractor,
+        )
+        evidence_index = json.loads(
+            (batch / loop.SOURCE_EVIDENCE_INDEX_FILENAME).read_text()
+        )
+        cache_key = evidence_index["job_cache_keys"]["V001"]
+        cached_frame = (
+            batch
+            / "streaming-results"
+            / "source-evidence"
+            / cache_key
+            / "inputs"
+            / "frames"
+            / "frame-001.jpg"
+        )
+        cached_frame.write_bytes(b"tampered")
+
+        with self.assertRaisesRegex(loop.LoopError, "源证据缓存"):
+            loop.write_video_to_prompt_node_input(
+                batch,
+                self.project_root,
+                "V001",
+                self.temp / "source-cache-second",
+                loop.select_job_reference_records(batch, "V001"),
+                analysis_tool=analysis_tool,
+                frame_extractor=self._fake_frame_extractor,
+            )
+
+    def test_coherent_cache_and_manifest_tamper_is_rejected_by_flow_anchor(self):
+        batch = self._prepared_batch()
+        analysis_tool = self.temp / "ffmpeg-coherent-tamper-fixture"
+        analysis_tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        analysis_tool.chmod(0o755)
+        self._freeze_source_evidence(batch, analysis_tool)
+        evidence_index = json.loads(
+            (batch / loop.SOURCE_EVIDENCE_INDEX_FILENAME).read_text()
+        )
+        cache_key = evidence_index["job_cache_keys"]["V001"]
+        cache_dir = (
+            batch / "streaming-results" / "source-evidence" / cache_key
+        )
+        frame = cache_dir / "inputs" / "frames" / "frame-001.jpg"
+        frame.write_bytes(b"coherently-tampered-frame")
+        manifest_path = cache_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["sampled_frames"][0]["size_bytes"] = frame.stat().st_size
+        manifest["sampled_frames"][0]["sha256"] = loop.sha256_file(frame)
+        loop.atomic_write_json(manifest_path, manifest)
+
+        with self.assertRaisesRegex(loop.LoopError, "flow 冻结后发生变化"):
+            loop.write_video_to_prompt_node_input(
+                batch,
+                self.project_root,
+                "V001",
+                self.temp / "coherent-tamper-workspace",
+                loop.select_job_reference_records(batch, "V001"),
+                analysis_tool=analysis_tool,
+                frame_extractor=self._fake_frame_extractor,
+            )
+
     def test_parent_blocks_duplicate_material_names_for_name_only_body(self):
         batch = self._prepared_batch()
         workspace = self.temp / "duplicate-material-name-workspace"
         analysis_tool = self.temp / "ffmpeg-duplicate-name-fixture"
         analysis_tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         analysis_tool.chmod(0o755)
+        self._freeze_source_evidence(batch, analysis_tool)
         original = loop.select_job_reference_records(batch, "V001")[0]
         duplicate_a = dict(original, semantic_name="重复名称")
         duplicate_b = dict(original, id="R002", semantic_name="重复名称")
@@ -564,12 +694,15 @@ class VideoBatchNodeIsolationTest(unittest.TestCase):
 
     def test_parent_promotes_structured_prompt_result_to_prompt_txt(self):
         batch = self._prepared_batch()
+        references = loop.select_job_reference_records(batch, "V001")
         prompt = (
             "素材绑定：@视频1=原视频；@图片1=车内饰。\n\n"
             "镜头1（0.0-1.0s）\n替换为车内饰。\n"
         )
 
-        loop.promote_prompt_result(batch, self.project_root, "V001", prompt)
+        loop.promote_prompt_result(
+            batch, self.project_root, "V001", references, prompt
+        )
 
         output_dir = loop.job_output_dir(self.project_root, batch, "V001")
         self.assertEqual(
@@ -577,16 +710,26 @@ class VideoBatchNodeIsolationTest(unittest.TestCase):
         )
         self.assertFalse((output_dir / "source-analysis.json").exists())
         self.assertFalse((output_dir / "reference-analysis.json").exists())
-        self.assertEqual((output_dir / "prompt.txt").read_text(), prompt)
+        persisted = (output_dir / "prompt.txt").read_text()
+        self.assertEqual(
+            persisted,
+            loop.compose_execution_prompt(batch, "V001", references, prompt) + "\n",
+        )
+        self.assertIn("- 保持原时长", persisted)
+        self.assertIn(
+            "- 替换 Ford Escape 内饰，使用车内饰作为目标内饰参考",
+            persisted,
+        )
 
     def test_parent_rejects_empty_or_non_string_prompt_result(self):
         batch = self._prepared_batch()
+        references = loop.select_job_reference_records(batch, "V001")
         for invalid in (None, "", "   \n"):
             with self.subTest(invalid=invalid), self.assertRaisesRegex(
                 loop.LoopError, "提示词交付为空"
             ):
                 loop.promote_prompt_result(
-                    batch, self.project_root, "V001", invalid
+                    batch, self.project_root, "V001", references, invalid
                 )
 
     def test_video_to_prompt_runtime_stages_samples_for_read_only_model_turn(self):
@@ -595,6 +738,7 @@ class VideoBatchNodeIsolationTest(unittest.TestCase):
         analysis_tool = self.temp / "ffmpeg-runtime-fixture"
         analysis_tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         analysis_tool.chmod(0o755)
+        self._freeze_source_evidence(batch, analysis_tool)
         captured = {}
         real_writer = loop.write_video_to_prompt_node_input
 

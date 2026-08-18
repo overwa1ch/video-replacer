@@ -77,6 +77,17 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("Never infer `privacy_mode: none` from silence", self.skill)
         self.assertIn("silence is not authorization to use `none`", self.operator)
 
+    def test_parent_composes_and_rechecks_prompt_semantics(self) -> None:
+        combined = self.skill + self.operator
+        for phrase in (
+            "inserts the Job requirements as a fixed highest-priority block",
+            "requires every bound semantic name in that model section",
+            "submission-plan images to equal the declared references in order",
+            "Never paraphrase or weaken a user requirement",
+            "READY_FOR_SUBMISSION",
+        ):
+            self.assertIn(phrase, combined)
+
     def test_mosaic_is_workflow_owned_and_fail_closed(self) -> None:
         for sentence in (
             "workflow invokes its own fixed tool",

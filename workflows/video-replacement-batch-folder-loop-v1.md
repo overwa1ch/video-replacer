@@ -13,11 +13,11 @@ updated: 2026-08-13
 
 ```text
 同一下载任务中的 Agent setup 安装并检查当前合同所需的本地前置
-→ 通过 setup login-codex-node 配置稳定外置的节点专用 strict-file-auth CODEX_HOME，在同一稳定锁内以 exact production command 完成无认证与认证两阶段本机 zero-tool wire attestation，配置持久 Dreamina CLI 并写入实时 READY record
+→ 通过 setup login-codex-node 配置稳定外置的节点专用 strict-file-auth CODEX_HOME，在同一稳定锁内以共同 production zero-tool request surface 完成两阶段本机 wire attestation：无认证阶段追加 ephemeral credential-store 隔离覆盖，认证阶段保留 production file-auth 与摘要校验；随后配置持久 Dreamina CLI 并写入实时 READY record
 → Skill 从 READY record 读取 backend_profile，整理 schema-v3 批次与每个 Job 的 privacy_mode
 → 父流程用本地 FFmpeg 对当前源片做有界、带时间戳抽帧
 → 无执行/文件系统工具的 Video-to-Prompt 回合只接收抽帧、绑定参考图和结构化 JSON
-→ 回合返回结构化提示词字符串，父流程校验后写 `prompt.txt`
+→ 回合返回结构化提示词字符串，父流程重建规范素材绑定、插入不可变 Job 需求并通过语义 Gate 后写 `prompt.txt`
 → mosaic_required 时自动生成打码输入
 → 检查真正准备上传的视频，必要时做本地上传准备
 → 本地 probe 与 submission plan
@@ -28,7 +28,7 @@ updated: 2026-08-13
 → COMPLETED 或 blocked/PARTIAL
 ```
 
-确定性父流程读取当前 Job 源视频，用受信 FFmpeg 生成从开头帧起、按时间均匀分布的有界顺序抽帧，并校验时间戳、大小与 SHA-256。受支持后端的源片最长 30 秒，当前以 0.75 秒节奏取样；对异常更长输入，有界策略也会把帧均匀分布在全程，而不是只消耗在片头。源视频本身不附加给 Codex 回合。回合只接收父层附加的抽帧、有序参考图和结构化 Job JSON，在一次模型调用中完成观察与提示词写作。它不写文件；父流程校验返回的结构化字符串后才持久化 `prompt.txt`。不会产生中间分析产物交给第二个模型，也不创建画面质量审查、隐私效果复核或生成结果审查任务。
+确定性父流程读取当前 Job 源视频，用受信 FFmpeg 生成从开头帧起、按时间均匀分布的有界顺序抽帧，并校验时间戳、大小与 SHA-256。受支持后端的源片最长 30 秒，当前以 0.75 秒节奏取样；对异常更长输入，有界策略也会把帧均匀分布在全程，而不是只消耗在片头。源视频本身不附加给 Codex 回合。回合只接收父层附加的抽帧、有序参考图和结构化 Job JSON，在一次模型调用中完成观察与提示词写作。它不写文件；父流程用登记数据重建素材绑定，把 `requirements.txt` 中该 Job 的原始文字解析并替换素材句柄后插入最高优先级区块，再把节点内容放进独立的模型逐镜说明区，并要求所有绑定语义名称都出现在该区。该 Gate 通过后才持久化 `prompt.txt`。不会产生中间分析产物交给第二个模型，也不创建画面质量审查、隐私效果复核或生成结果审查任务。
 
 ## 路径合同
 
@@ -52,11 +52,11 @@ Git 跟踪区只保存 skill、workflow、执行器、合同和测试。批次�
 | 用户 | 首次安装时完成必要账户授权或受保护凭证输入；提供任务要求；批准当前批次的付费提交。 |
 | Project Agent + local skill | 在同一下载任务中立即安装依赖与马赛克能力、配置持久后端并取得当前 setup 合同的实时 READY；整理可信输入；按需创建参考图；从 setup record 读取受控 profile；写 schema-v3 `job-bindings.json`；调用控制面；等待；简略汇报。 |
 | JavaScript 控制面 | 命令入口、互斥、shadow 边界、当前批次付费 capability、进程等待和恢复调度。 |
-| Python 父层 | 批次索引、输入哈希、显式 `privacy_mode`、受信本地 FFmpeg 抽帧、抽帧/参考图附加、节点 Codex 进程串行化、结构化结果校验与 `prompt.txt` 持久化、自动打码、上传准备、确定性 Gate、preflight、submission plan 和任务防重。 |
+| Python 父层 | 批次索引、输入哈希、显式 `privacy_mode`、受信本地 FFmpeg 抽帧、抽帧/参考图附加、节点 Codex 进程串行化、规范绑定与不可变需求组装、素材语义覆盖校验、`prompt.txt` 持久化、自动打码、上传准备、preflight、submission plan 和任务防重。 |
 | 单个隔离回合 | 单 Job sampled Video-to-Prompt：只根据父层附加的抽帧、有序参考图和结构化 JSON 返回提示词字符串；无执行/文件系统工具，不持久化文件。 |
 | adapter registry | 将冻结 profile 绑定到审核过的即梦 CLI 或 Ark adapter；不接受批次指定的可执行文件、模型或压缩参数。 |
 
-批处理回合只接收当前阶段的内联合同和父层附加图像。`CODEX_EXEC_SERVER_URL=none` 使 `execution_environment` 固定为 `none`，Codex 不注册执行或文件系统环境；shell、patch、文件读取、权限请求和网络工具均不可用。回合使用 setup 专门创建的稳定外置 strict-file-auth `CODEX_HOME`；该 home 不包含 `AGENTS.md`、rules、skills、plugins、MCP、hooks 或其他用户配置。Windows 的统一 resolver 通过 Known Folder API 从真实当前用户 token 固定 state root 为 `FOLDERID_LocalAppData/video-replacer`，忽略伪造的 `LOCALAPPDATA`，且只接受等值重述 canonical root 的 `VIDEO_REPLACER_STATE_DIR`。Windows home、`auth.json` 与认证锁只允许本机 fixed drive，拒绝重定向、UNC、mapped/non-fixed drive 和 reparse 路径，并使用 owner 为当前用户、仅当前用户与 `SYSTEM` full control、继承受保护的 DACL。显式登录只在锁内通过安全结构/ACL 与稳定文件身份检查后清除格式错误的普通 `auth.json`，随后必须通过严格 file-auth schema；有效 auth 保留，链接、非常规文件或不安全 home fail closed。Doctor 直接验证生产使用的这一 home，而不为每次回合复制外层 auth，并在同一稳定锁内用 exact production command、合成图片和 loopback Responses provider 捕获两阶段最终 request：`requires_openai_auth=false` 阶段写入 required check `codex-wire`，只允许图片、零顶层/附加 tools、零 multi-agent hints 和零 auth header；`requires_openai_auth=true` 阶段写入 required check `codex-file-auth-wire`，要求相同 zero-tool surface，并用内存 SHA-256 与 `hmac.compare_digest` 证明 Bearer 等于稳定 `auth.json` `access_token`。两阶段捕获的模型请求都路由到 loopback，并由 HTTP 418 在模型响应或推理前停止；原始 token/header 不保留或记录。该 wire 证据不判断进程的其他网络活动，使用的只是合成图片且不包含视频后端或付费命令；managed/system 配置重新注入 MCP、hook、tool 或 Agent hint 时阻断 READY。所有节点 Codex 进程串行，避免并发刷新或改写 file-auth token。
+批处理回合只接收当前阶段的内联合同和父层附加图像。`CODEX_EXEC_SERVER_URL=none` 使 `execution_environment` 固定为 `none`，Codex 不注册执行或文件系统环境；shell、patch、文件读取、权限请求和网络工具均不可用。回合使用 setup 专门创建的稳定外置 strict-file-auth `CODEX_HOME`；该 home 不包含 `AGENTS.md`、rules、skills、plugins、MCP、hooks 或其他用户配置。Windows 的统一 resolver 通过 Known Folder API 从真实当前用户 token 固定 state root 为 `FOLDERID_LocalAppData/video-replacer`，忽略伪造的 `LOCALAPPDATA`，且只接受等值重述 canonical root 的 `VIDEO_REPLACER_STATE_DIR`。Windows home、`auth.json` 与认证锁只允许本机 fixed drive，拒绝重定向、UNC、mapped/non-fixed drive 和 reparse 路径，并使用 owner 为当前用户、仅当前用户与 `SYSTEM` full control、继承受保护的 DACL。显式登录只在锁内通过安全结构/ACL 与稳定文件身份检查后清除格式错误的普通 `auth.json`，随后必须通过严格 file-auth schema；有效 auth 保留，链接、非常规文件或不安全 home fail closed。Doctor 直接验证生产使用的这一 home，而不为每次回合复制外层 auth，并在同一稳定锁内用共同的 production zero-tool request surface、合成图片和 loopback Responses provider 捕获两阶段最终 request：`requires_openai_auth=false` 阶段在生产命令末尾追加 `cli_auth_credentials_store="ephemeral"` 隔离覆盖并写入 required check `codex-wire`，只允许图片、零顶层/附加 tools、零 multi-agent hints 和零 auth/账号路由 header；`requires_openai_auth=true` 阶段保留 production file-auth 命令并写入 required check `codex-file-auth-wire`，要求相同 zero-tool surface，并用内存 SHA-256 与 `hmac.compare_digest` 证明 Bearer 等于稳定 `auth.json` `access_token`。两阶段捕获的模型请求都路由到 loopback，并由 HTTP 418 在模型响应或推理前停止；原始 token/header 不保留或记录。该 wire 证据不判断进程的其他网络活动，使用的只是合成图片且不包含视频后端或付费命令；managed/system 配置重新注入 MCP、hook、tool 或 Agent hint 时阻断 READY。所有节点 Codex 进程串行，避免并发刷新或改写 file-auth token。
 
 ## 新批次合同
 
@@ -106,7 +106,7 @@ Agent 只提交 `schema_version`、`batch_id`、批次级 `backend_profile`、`j
 
 打码阶段只要求命令成功和输出文件存在。失败时当前 Job 阻塞，原片不会作为上传回退项。流程不检查命中数、画面覆盖度或打码效果。
 
-旧 schema v1/v2 或旧提示词管线只允许恢复全 Job 已完成且提交计划可验证的冻结结果；任何半成品都必须重新整理 schema v3 新批次。新 flow 绑定 `video-to-prompt-v2-sampled-readonly`、固定节点模型与当前节点合同 SHA-256，任一项变化后都拒绝续跑旧 flow。
+旧 schema v1/v2、旧提示词管线，或尚未绑定源证据索引的旧 flow，只允许恢复全 Job 已完成且提交计划可验证的冻结结果；任何半成品都必须重新整理 schema v3 新批次。重建时逐字复制旧批次的 `requirements.txt` 和未变化绑定，禁止为了通过节点或 Gate 改写硬约束。新 flow 绑定 `video-to-prompt-v3-parent-composed`、固定节点模型、当前节点合同 SHA-256、`source-evidence-index.json` SHA-256、取样规则和 FFmpeg 身份，任一项变化后都拒绝续跑旧 flow。
 
 ## 受控 profile 与本地上传准备
 
@@ -146,7 +146,7 @@ Ark adapter 当前只用于内部开发和测试；它没有持久 credential br
 
 ## 单回合抽帧视频到提示词
 
-当前模型回合固定为 sampled Video-to-Prompt。父层先固定当前 Job 需求和有序参考素材绑定，再在本地用受信 FFmpeg 从开头帧起做有界、按时间均匀分布的顺序抽帧。父层校验帧文件、时间顺序、大小与 SHA-256，然后将抽帧、参考图和声明时长/时间戳/需求/绑定的 JSON 作为同一回合输入。抽帧是有界观察证据，不是完整视频语义的保证；无法从已给帧区分必需事实时，回合应返回 `BLOCKED` 而不是猜测。
+当前模型回合固定为 sampled Video-to-Prompt。父层先固定当前 Job 需求和有序参考素材绑定，再在本地用受信 FFmpeg 从开头帧起做有界、按时间均匀分布的顺序抽帧。缓存键同时绑定当前源大小/SHA、取样 recipe 和 FFmpeg 大小/SHA；命中时每个 Job 仍复制为自己的普通文件并重验哈希。参考图、需求、模型回合、prompt Gate、probe 与 submission plan 不复用。父层校验帧文件、时间顺序、大小与 SHA-256，然后将抽帧、参考图和声明时长/时间戳/需求/绑定的 JSON 作为同一回合输入。抽帧是有界观察证据，不是完整视频语义的保证；无法从已给帧区分必需事实时，回合应返回 `BLOCKED` 而不是猜测。
 
 回合使用 `CODEX_EXEC_SERVER_URL=none`，无执行、文件系统或网络工具，只根据已附加内容返回 schema 绑定的提示词字符串或精确 blocker。父层校验返回结果并独占写入 `prompt.txt`。该设计不产生、复用或传递中间分析 JSON；回合也不执行质量、适用性、身份一致性或生成结果审查。`COMPLETE` 只表示父层收到可校验的非空提示词；父层完成其余确定性 Gate、active video、上传准备、无费用 preflight 和 `submission-plan.json` 后，Job 才进入 `READY_FOR_SUBMISSION`。
 
@@ -162,13 +162,17 @@ Ark adapter 当前只用于内部开发和测试；它没有持久 credential br
 
 `once` 和 `watch` 固定为本地 shadow：可以接入、索引和记录本地状态，不上传、不创建远端任务。它们拒绝任何付费参数。
 
+`check <batch>` 在内存中建立尚未冻结的参考索引视图并校验需求/绑定，不写 `reference-index.json`。`prepare` 首次持久化该索引；已有 flow 或 streaming result 后缺失/变化均阻塞，禁止静默覆盖。
+
 ### 本地准备
 
 ```text
 [LAUNCHER, "prepare", <batch>]
 ```
 
-`prepare` 要求批次位于 `needs-input/` 且 `PAUSE` 存在。它运行分析、提示词、可选自动打码、上传准备、Gate、无费用 probe 和 submission plan；它不上传、不创建远端任务。
+`prepare` 要求批次位于 `needs-input/` 且 `PAUSE` 存在。父流程先按 unique source 建立源证据缓存，并用 `source-evidence-index.json` 冻结每个 manifest、帧哈希、取样规则与 FFmpeg 身份；该索引哈希进入 flow 指纹。JavaScript 随后按 flow 中稳定的 `V###` 顺序以并发 1 严格 FIFO 调用准备 worker，并分别记录 queue wait、auth-lock wait 与 Codex exec 时间。它运行提示词、可选自动打码、上传准备、Gate、无费用 probe 和 submission plan；它不上传、不创建远端任务。只有没有 eligible Job 阻塞时，批次状态才是 `LOCAL_PREPARED_AWAITING_APPROVAL`；部分成功仍是 `LOCAL_PREPARATION_BLOCKED`。每个 Job 的内部 `READY_FOR_SUBMISSION` 不等于已经取得付费授权。
+
+单个本地准备失败时可运行 `[LAUNCHER, "retry-prepare", <batch>, <V###>]`。该命令只接受 `needs-input/`、`PAUSE` 和当前 `BLOCKED/FAILED` 结果，或提交计划已无法通过确定性复验的 READY 结果；它先复制归档旧 attempt，保持 canonical 结果不动，直到新 attempt 原子替换成功。任何 submission result、payment checkpoint 或 task ID 都会阻断它。
 
 ### 当前批次一次付费提交
 
@@ -188,7 +192,7 @@ Python 扫描 stdout 只输出一个 JSON；过程信息进入 stderr。JavaScri
 
 历史 `review/` 批次保留原位并可读取；新任务不写入 `review/`。
 
-原进程中断后，使用 `status --json`、批次状态文件和外置账本判断恢复动作。已记录 task ID 的 Job 恢复同一任务；提交状态不确定时保持阻塞。
+原进程中断后，使用 `status <batch> --json`、批次状态文件和外置账本判断恢复动作。已记录 task ID 的 Job 恢复同一任务；提交状态不确定时保持阻塞。
 
 最终汇报只包含批次路径、Job 绑定、`backend_profile`、`privacy_mode`、本地准备或生成终态、生成文件路径、task ID 和精确 blocker。汇报不评价画面、人物一致性、打码覆盖效果或生成质量。
 

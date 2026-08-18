@@ -47,8 +47,15 @@ def route(
 
     if arguments and arguments[0] == "status":
         remaining = list(arguments[1:])
-        if remaining not in ([], ["--json"]):
-            raise ValueError("public status accepts only the optional --json flag")
+        json_count = remaining.count("--json")
+        batch_values = [value for value in remaining if value != "--json"]
+        if (
+            len(remaining) > 2
+            or json_count > 1
+            or len(batch_values) > 1
+            or any(value.startswith("--") for value in batch_values)
+        ):
+            raise ValueError("public status accepts one optional batch and --json")
         return [
             node,
             str(orchestrator),

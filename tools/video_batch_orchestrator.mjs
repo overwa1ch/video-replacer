@@ -4,7 +4,7 @@
  * JavaScript control plane for the folder-driven video replacement batch loop.
  *
  * The Python engine owns batch state, external 0700 node-run workspaces,
- * read-only workspace roots with stage-specific writable subdirectories,
+ * zero-write model workspaces,
  * artifact promotion, and deterministic gates. This process owns scheduling,
  * explicit paid-command authorization, process exclusivity, health snapshots, signal
  * handling, and failure backoff.
@@ -55,6 +55,7 @@ const PAYMENT_TOKEN_COMMANDS = new Set([
   "submit-prepared",
   "retry-sequential",
 ]);
+const PREPARATION_QUEUE_COMMANDS = new Set(["prepare", "submit-prepared"]);
 export const PAYMENT_AUTH_TOKEN_ENV = "VIDEO_LOOP_PAYMENT_AUTH_TOKEN";
 export const PAYMENT_CHECKPOINT_TTL_SECONDS = 7200;
 const DIRECT_COMMANDS = new Set([
@@ -62,6 +63,7 @@ const DIRECT_COMMANDS = new Set([
   "once",
   "check",
   "prepare",
+  "retry-prepare",
   "submit-job",
   "submit-prepared",
   "retry-sequential",
@@ -205,13 +207,21 @@ export async function resolveOptions(argv, environment = process.env) {
   const command = positionals[0] || (values.help ? "help" : undefined);
   const batch = positionals[1];
   const jobId = positionals[2];
-  const maxPositionals = command === "submit-job" ? 3 : 2;
+  const maxPositionals = ["submit-job", "retry-prepare"].includes(command) ? 3 : 2;
   if (positionals.length > maxPositionals) {
     throw new OrchestratorError(`多余的位置参数：${positionals.slice(2).join(" ")}`);
   }
 
   const limits = config.limits || {};
   const watch = config.watch || {};
+  const requestedPreparationConcurrency = parseInteger(
+    values.preparationConcurrency ??
+      environment.VIDEO_LOOP_PREPARATION_CONCURRENCY ??
+      config.concurrency?.preparation ??
+      1,
+    "preparation-concurrency",
+    1,
+  );
   const options = {
     command,
     batch,
@@ -269,14 +279,16 @@ export async function resolveOptions(argv, environment = process.env) {
       1,
     ),
     maxCycles: parseInteger(values.maxCycles ?? 0, "max-cycles", 0),
-    preparationConcurrency: parseInteger(
-      values.preparationConcurrency ??
-        environment.VIDEO_LOOP_PREPARATION_CONCURRENCY ??
-        config.concurrency?.preparation ??
-        3,
-      "preparation-concurrency",
-      1,
-    ),
+    // The effective policy is always strict FIFO.  Keep accepting legacy
+    // env/config values so read-only commands and older installations do not
+    // fail before they can report status.  A misleading explicit CLI override
+    // is rejected below only for commands that actually run the FIFO queue.
+    preparationConcurrency: 1,
+    requestedPreparationConcurrency,
+    preparationConcurrencyCliOverride:
+      values.preparationConcurrency === undefined
+        ? null
+        : requestedPreparationConcurrency,
     generationConcurrency: parseInteger(
       values.generationConcurrency ??
         environment.VIDEO_LOOP_GENERATION_CONCURRENCY ??
@@ -307,6 +319,18 @@ export function validateOptions(options) {
   }
   if (options.command === "submit-job" && !options.jobId) {
     throw new OrchestratorError("submit-job 需要 V 编号");
+  }
+  if (options.command === "retry-prepare" && (!options.batch || !options.jobId)) {
+    throw new OrchestratorError("retry-prepare 需要 batch 和 V 编号");
+  }
+  if (
+    PREPARATION_QUEUE_COMMANDS.has(options.command) &&
+    options.preparationConcurrencyCliOverride !== null &&
+    options.preparationConcurrencyCliOverride !== 1
+  ) {
+    throw new OrchestratorError(
+      "preparation-concurrency 当前必须为 1；本地提示词准备采用严格 FIFO",
+    );
   }
   if (PAID_COMMANDS.has(options.command) && !options.confirmPaid) {
     throw new OrchestratorError(
@@ -355,7 +379,7 @@ export function buildEngineArgs(options, command = options.command) {
     if (command === "inspect-flow" && options.preparationOnly) {
       args.push("--preparation-only");
     }
-  } else if (["prepare-job", "submit-job"].includes(command)) {
+  } else if (["prepare-job", "retry-prepare-job", "submit-job"].includes(command)) {
     args.push(options.batch, options.jobId);
     if (command === "submit-job") {
       args.push("--task-timeout", String(options.taskTimeout));
@@ -516,6 +540,65 @@ export async function runJobPipeline(jobs, controls) {
   const failure = settled.find((item) => item.status === "rejected");
   if (failure) throw failure.reason;
   return settled.map((item) => item.value);
+}
+
+export async function runPreparationQueue(jobs, controls) {
+  const queuedAt = utcNow();
+  const queuedAtMonotonic = process.hrtime.bigint();
+  const schedulePath = join(
+    controls.batch,
+    "streaming-results",
+    controls.scheduleName || "preparation-schedule.json",
+  );
+  const schedule = {
+    schema_version: 1,
+    batch_id: basename(controls.batch),
+    policy: "STRICT_FIFO",
+    effective_concurrency: 1,
+    created_at: queuedAt,
+    updated_at: queuedAt,
+    jobs: jobs.map((job, index) => ({
+      id: job.id,
+      queue_index: index + 1,
+      phase: "QUEUED",
+      queued_at: queuedAt,
+      worker_started_at: null,
+      worker_finished_at: null,
+      queue_wait_seconds: null,
+      worker_seconds: null,
+    })),
+  };
+  await atomicWriteJson(schedulePath, schedule);
+  const results = [];
+  for (let index = 0; index < jobs.length; index += 1) {
+    const job = jobs[index];
+    const record = schedule.jobs[index];
+    const workerStartedMonotonic = process.hrtime.bigint();
+    record.phase = "WORKER_RUNNING";
+    record.worker_started_at = utcNow();
+    record.queue_wait_seconds = Number(
+      (Number(workerStartedMonotonic - queuedAtMonotonic) / 1e9).toFixed(6),
+    );
+    schedule.updated_at = utcNow();
+    await atomicWriteJson(schedulePath, schedule);
+    try {
+      results.push(await controls.prepareJob(job));
+      record.phase = "FINISHED";
+    } catch (error) {
+      record.phase = "FAILED";
+      record.error = tailText(String(error?.message || error), 1000);
+      throw error;
+    } finally {
+      const workerFinishedMonotonic = process.hrtime.bigint();
+      record.worker_finished_at = utcNow();
+      record.worker_seconds = Number(
+        (Number(workerFinishedMonotonic - workerStartedMonotonic) / 1e9).toFixed(6),
+      );
+      schedule.updated_at = utcNow();
+      await atomicWriteJson(schedulePath, schedule);
+    }
+  }
+  return results;
 }
 
 function paymentCheckpointAuthorizer(options, batch, flow) {
@@ -872,14 +955,21 @@ export async function runStreamingBatch(options, batch, { preparationOnly = fals
   const scoped = { ...options, batch, preparationOnly };
   const flow = await runWorkerJson(scoped, "inspect-flow");
   const jobs = Array.isArray(flow.jobs) ? flow.jobs : [];
+  const preparations = await runPreparationQueue(jobs, {
+    batch,
+    prepareJob: (job) =>
+      runWorkerJson({ ...scoped, jobId: job.id }, "prepare-job"),
+  });
+  const preparationByJob = new Map(
+    preparations.map((preparation, index) => [jobs[index].id, preparation]),
+  );
   const authorizeJob = paymentCheckpointAuthorizer(scoped, batch, flow);
   const results = await runJobPipeline(jobs, {
-    preparationConcurrency: options.preparationConcurrency,
+    preparationConcurrency: 1,
     generationConcurrency: options.generationConcurrency,
     execute: options.execute,
     allowSubmission: !preparationOnly,
-    prepareJob: (job) =>
-      runWorkerJson({ ...scoped, jobId: job.id }, "prepare-job"),
+    prepareJob: (job) => preparationByJob.get(job.id),
     submitJob: async (job) => {
       await authorizeJob(job.id);
       return runWorkerJson({ ...scoped, jobId: job.id }, "submit-job");
@@ -901,21 +991,23 @@ export async function runPreparedStreamingBatch(options, batch) {
   };
   const flow = await runWorkerJson(scoped, "inspect-flow");
   const jobs = Array.isArray(flow.jobs) ? flow.jobs : [];
-  const preparationPool = new Semaphore(options.preparationConcurrency);
-  const preparations = await Promise.all(
-    jobs.map((job) =>
-      preparationPool.use(() =>
-        runWorkerJson({ ...scoped, jobId: job.id }, "prepare-job"),
-      ),
-    ),
-  );
+  const preparations = await runPreparationQueue(jobs, {
+    batch,
+    scheduleName: "submission-revalidation-schedule.json",
+    prepareJob: (job) =>
+      runWorkerJson({ ...scoped, jobId: job.id }, "prepare-job"),
+  });
   const preparationByJob = new Map(
     preparations.map((preparation, index) => [jobs[index].id, preparation]),
+  );
+  const localPreparation = await runWorkerJson(
+    scoped,
+    "finalize-preparation-flow",
   );
   await runWorkerJson(scoped, "preflight-submission");
   const authorizeJob = paymentCheckpointAuthorizer(scoped, batch, flow);
   const results = await runJobPipeline(jobs, {
-    preparationConcurrency: options.preparationConcurrency,
+    preparationConcurrency: 1,
     generationConcurrency: options.generationConcurrency,
     execute: true,
     allowSubmission: true,
@@ -926,7 +1018,7 @@ export async function runPreparedStreamingBatch(options, batch) {
     },
   });
   const finalized = await runWorkerJson(scoped, "finalize-flow");
-  return { flow, results, finalized };
+  return { flow, preparations: localPreparation, results, finalized };
 }
 
 export async function runPreparedStreamingJob(options, batch, jobId) {
@@ -943,6 +1035,7 @@ export async function runPreparedStreamingJob(options, batch, jobId) {
     throw new OrchestratorError(`当前 flow 中没有可提交的 ${jobId}`);
   }
   await runWorkerJson({ ...scoped, jobId }, "prepare-job");
+  await runWorkerJson(scoped, "finalize-preparation-flow");
   await runWorkerJson(scoped, "preflight-submission");
   await writePaymentCheckpoint(scoped, batch, flow, { jobIds: [jobId] });
   const submission = await runWorkerJson(scoped, "submit-job");
@@ -991,6 +1084,141 @@ export async function readLoopSummary(loopRoot) {
     states,
     orchestrator,
   };
+}
+
+async function readOptionalJson(path) {
+  try {
+    return JSON.parse(await readFile(path, "utf8"));
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw new OrchestratorError(`无法读取状态文件 ${path}：${error.message}`);
+  }
+}
+
+export async function readBatchStatus(batch) {
+  const loopState = await readOptionalJson(join(batch, "loop-state.json"));
+  const flow = await readOptionalJson(join(batch, "streaming-flow.json"));
+  const jobs = Array.isArray(flow?.jobs) ? flow.jobs : [];
+  const preparationSchedule = await readOptionalJson(
+    join(batch, "streaming-results", "preparation-schedule.json"),
+  );
+  const submissionRevalidationSchedule = await readOptionalJson(
+    join(batch, "streaming-results", "submission-revalidation-schedule.json"),
+  );
+  const latestNodeProcesses = await readLatestNodeProcesses(batch);
+  const preparation = [];
+  for (const rawJob of jobs) {
+    const jobId = rawJob?.id;
+    if (typeof jobId !== "string") continue;
+    const result = await readOptionalJson(
+      join(batch, "streaming-results", "preparation", `${jobId}.json`),
+    );
+    preparation.push({
+      id: jobId,
+      skipped: rawJob?.skipped === true,
+      preparation_status: result?.job?.status || "NOT_PREPARED",
+      blocker: result?.job?.blocker || null,
+    });
+  }
+  const loopClaimsPaidReady =
+    loopState?.state === "LOCAL_PREPARED_AWAITING_APPROVAL" ||
+    loopState?.payment_approval_required === true;
+  const canonicalPreparationBlocked =
+    loopClaimsPaidReady &&
+    preparation.some(
+      (job) => job.skipped !== true && job.preparation_status !== "READY_FOR_SUBMISSION",
+    );
+  return {
+    schema_version: 1,
+    batch_id: basename(batch),
+    batch_path: batch,
+    state: canonicalPreparationBlocked
+      ? "LOCAL_PREPARATION_BLOCKED"
+      : loopState?.state || "NOT_INSPECTED",
+    payment_approval_required:
+      !canonicalPreparationBlocked &&
+      loopState?.payment_approval_required === true,
+    flow_fingerprint: flow?.flow_fingerprint || null,
+    schedules: {
+      preparation: preparationSchedule,
+      submission_revalidation: submissionRevalidationSchedule,
+    },
+    latest_node_process:
+      latestNodeProcesses.length > 0 ? latestNodeProcesses[0] : null,
+    latest_node_processes: latestNodeProcesses,
+    preparation,
+    observed_at: utcNow(),
+  };
+}
+
+async function readLatestNodeProcesses(batch) {
+  const agentsRoot = join(batch, "streaming-results", "agents");
+  let scopes;
+  try {
+    scopes = await readdir(agentsRoot, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw new OrchestratorError(`无法读取节点运行状态 ${agentsRoot}：${error.message}`);
+  }
+  const records = [];
+  for (const scopeEntry of scopes) {
+    if (!scopeEntry.isDirectory() || scopeEntry.name.startsWith(".")) continue;
+    const scopePath = join(agentsRoot, scopeEntry.name);
+    let invocations;
+    try {
+      invocations = await readdir(scopePath, { withFileTypes: true });
+    } catch (error) {
+      throw new OrchestratorError(`无法读取节点运行状态 ${scopePath}：${error.message}`);
+    }
+    const candidates = invocations
+      .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
+      .sort((left, right) => right.name.localeCompare(left.name));
+    let invocation = null;
+    let processRecord = null;
+    for (const candidate of candidates) {
+      const candidateRecord = await readOptionalJson(
+        join(scopePath, candidate.name, "codex-process.json"),
+      );
+      if (candidateRecord && typeof candidateRecord === "object") {
+        invocation = candidate;
+        processRecord = candidateRecord;
+        break;
+      }
+    }
+    if (!invocation || !processRecord) continue;
+    let phase = processRecord.phase;
+    let phaseSource = "recorded";
+    if (typeof phase !== "string" || !phase) {
+      phaseSource = "inferred_legacy";
+      if (processRecord.timed_out === true) phase = "TIMED_OUT";
+      else if (Number.isInteger(processRecord.returncode)) {
+        phase = processRecord.returncode === 0 ? "SUCCEEDED" : "FAILED";
+      } else if (processRecord.finished_at) phase = "FINISHED_UNKNOWN";
+      else phase = "UNKNOWN";
+    }
+    records.push({
+      scope: scopeEntry.name,
+      invocation_id: invocation.name,
+      phase,
+      phase_source: phaseSource,
+      stage: processRecord.stage || null,
+      job_ids: Array.isArray(processRecord.job_ids) ? processRecord.job_ids : [],
+      queued_at: processRecord.queued_at || null,
+      started_at: processRecord.started_at || null,
+      lock_acquired_at: processRecord.lock_acquired_at || null,
+      exec_started_at: processRecord.exec_started_at || null,
+      exec_finished_at: processRecord.exec_finished_at || null,
+      auth_lock_wait_seconds: processRecord.auth_lock_wait_seconds ?? null,
+      exec_seconds: processRecord.exec_seconds ?? null,
+      total_seconds: processRecord.total_seconds ?? null,
+      transport_reconnect_count: processRecord.transport_reconnect_count ?? null,
+    });
+  }
+  return records.sort((left, right) => {
+    const leftTime = left.queued_at || left.started_at || left.invocation_id;
+    const rightTime = right.queued_at || right.started_at || right.invocation_id;
+    return rightTime.localeCompare(leftTime);
+  });
 }
 
 async function atomicWriteJson(path, value) {
@@ -1200,6 +1428,30 @@ function printHumanStatus(summary) {
   }
 }
 
+function printHumanBatchStatus(summary) {
+  console.log(`批次 ${summary.batch_id}: ${summary.state}`);
+  console.log(
+    `付费批准：${summary.payment_approval_required ? "仍需用户明确批准" : "当前不需要"}`,
+  );
+  for (const [name, schedule] of Object.entries(summary.schedules || {})) {
+    if (!schedule) continue;
+    const phases = Array.isArray(schedule.jobs)
+      ? schedule.jobs.map((job) => `${job.id}=${job.phase}`).join(", ")
+      : "无 Job 记录";
+    console.log(`${name} 调度：${schedule.policy || "UNKNOWN"} (${phases})`);
+  }
+  if (summary.latest_node_process) {
+    console.log(
+      `最新节点：${summary.latest_node_process.scope} / ${summary.latest_node_process.phase}`,
+    );
+  }
+  for (const job of summary.preparation) {
+    console.log(
+      `${job.id}: ${job.preparation_status}${job.blocker ? ` (${job.blocker})` : ""}`,
+    );
+  }
+}
+
 export function usage() {
   return `视频替换 JavaScript 批量编排器
 
@@ -1210,9 +1462,10 @@ export function usage() {
   init                  初始化批次目录
   once                  扫描一次；默认 shadow，不启动 Codex 或付费任务
   watch                 由 JavaScript 负责循环、退避、锁和健康快照
-  status                查看各状态目录与最近编排器状态
+  status [batch]        查看全局目录，或查看一个批次的真实 workflow state
   check <batch>         检查 requirements.txt 覆盖
   prepare <batch>       在 PAUSE 下完成隔离单 Job 节点 Gate 与本地 preview
+  retry-prepare <batch> <V编号>  重跑一个失败或本地提交计划失效的准备 Job
   submit-prepared <batch>  以生成池提交已准备批次（需 --confirm-paid）
   submit-job <batch> <V编号>  只提交一个已准备 Job（需 --confirm-paid）
   retry-sequential <batch> 串行语义重试（需授权 manifest 与 --confirm-paid）
@@ -1225,17 +1478,18 @@ export function usage() {
   --project-root <path> 项目根目录
   --python <path>       固定 Python 3.12 runtime
   --engine <path>       固定 Python 批次引擎
-  --preparation-concurrency <n>  单 Job 准备并发（默认 3）
+  --preparation-concurrency <n>  本地准备并发（固定 1，严格 FIFO）
   --generation-concurrency <n>   即梦生成并发（默认 2）
 
 节点隔离固定使用外置 0700 state/node-runs 和 sibling workspace/codex-home/transport。
-workspace 根只读；Video-to-Prompt 单节点仅 scratch+delivery 可写，并只交付 prompt.txt；
-可信 ffmpeg 已 hardlink/copy 到 workspace 内，工具断网，不提供 legacy sandbox/add-dir 开关。
+模型节点的 workspace 为零写入、工具与网络关闭；父进程先用可信 ffmpeg 生成并校验帧，
+再把帧和 JSON 作为只读输入交给模型；模型仅返回结构化结果，prompt.txt 由父进程落盘。
 
 示例：
   node tools/video_batch_orchestrator.mjs status
   node tools/video_batch_orchestrator.mjs watch
   node tools/video_batch_orchestrator.mjs prepare batch-001
+  node tools/video_batch_orchestrator.mjs retry-prepare batch-001 V003
   node tools/video_batch_orchestrator.mjs --confirm-paid submit-job batch-001 V001
 `;
 }
@@ -1247,9 +1501,15 @@ export async function main(argv = process.argv.slice(2)) {
     return 0;
   }
   if (options.command === "status") {
-    const summary = await readLoopSummary(options.loopRoot);
+    const summary = options.batch
+      ? await readBatchStatus(
+          await resolveBatchPath(options.loopRoot, options.batch),
+        )
+      : await readLoopSummary(options.loopRoot);
     if (options.json) {
       console.log(JSON.stringify(summary, null, 2));
+    } else if (options.batch) {
+      printHumanBatchStatus(summary);
     } else {
       printHumanStatus(summary);
     }
@@ -1277,6 +1537,28 @@ export async function main(argv = process.argv.slice(2)) {
       code: 0,
       signal: null,
       stdout: `${JSON.stringify(prepared.finalized)}\n`,
+      stderr: "",
+    };
+    process.stdout.write(result.stdout);
+  } else if (options.command === "retry-prepare") {
+    const batch = await resolveBatchPath(options.loopRoot, options.batch);
+    const retried = await withOrchestratorLock(options, async () => {
+      const scoped = {
+        ...options,
+        batch,
+        preparationOnly: true,
+      };
+      const retry = await runWorkerJson(
+        { ...scoped, jobId: options.jobId },
+        "retry-prepare-job",
+      );
+      const finalized = await runWorkerJson(scoped, "finalize-preparation-flow");
+      return { retry, finalized };
+    });
+    result = {
+      code: 0,
+      signal: null,
+      stdout: `${JSON.stringify(retried.finalized)}\n`,
       stderr: "",
     };
     process.stdout.write(result.stdout);

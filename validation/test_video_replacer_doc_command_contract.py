@@ -45,7 +45,14 @@ class DocCommandContractTest(unittest.TestCase):
             timeout=30,
         )
         helptext = result.stdout + result.stderr
-        for command in ("once", "check", "prepare", "submit-prepared", "status"):
+        for command in (
+            "once",
+            "check",
+            "prepare",
+            "retry-prepare",
+            "submit-prepared",
+            "status",
+        ):
             self.assertIn(command, helptext)
 
     def test_operator_docs_define_native_platform_launchers(self) -> None:

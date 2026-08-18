@@ -46,6 +46,41 @@ class VideoBatchLoopTest(unittest.TestCase):
     def observer(self):
         return loop.ObservationTracker(self.root, clock=lambda: self.now)
 
+    @staticmethod
+    def fake_source_evidence_extractor(_source, frame_root, _analysis_tool):
+        frame_root.mkdir(parents=True, exist_ok=False)
+        frame = frame_root / "frame-001.jpg"
+        frame.write_bytes(b"deterministic-source-evidence")
+        return {
+            "video_metadata": {
+                "duration_seconds": 1.0,
+                "width": 1280,
+                "height": 720,
+                "fps": 30.0,
+            },
+            "sampled_frames": [
+                {
+                    "image": frame.relative_to(frame_root.parents[1]).as_posix(),
+                    "timestamp_seconds": 0.0,
+                    "size_bytes": frame.stat().st_size,
+                    "sha256": loop.sha256_file(frame),
+                }
+            ],
+            "sampling_policy": {
+                "method": "uniform_timestamp_interval",
+                "interval_seconds": loop.VIDEO_PROMPT_MIN_FRAME_INTERVAL_SECONDS,
+                "minimum_interval_seconds": loop.VIDEO_PROMPT_MIN_FRAME_INTERVAL_SECONDS,
+                "max_frames": loop.VIDEO_PROMPT_MAX_FRAMES,
+            },
+        }
+
+    def freeze_source_evidence(self, batch):
+        return loop.ensure_source_evidence_index(
+            batch,
+            loop.verify_batch_index(batch),
+            frame_extractor=self.fake_source_evidence_extractor,
+        )
+
     def codex_node_home(self, state_dir):
         home = state_dir / loop.NODE_HOME_DIRECTORY
         home.mkdir(parents=True, exist_ok=True)
@@ -159,6 +194,47 @@ class VideoBatchLoopTest(unittest.TestCase):
         project_root = project_root or self.project
         executor = executor or self.executor
         images = list(images or [])
+        binding_payload = json.loads(
+            (batch / "job-bindings.json").read_text(encoding="utf-8")
+        )
+        binding_job = next(
+            item for item in binding_payload["jobs"] if item["id"] == job_id
+        )
+        if images and not binding_job["references"]:
+            binding_job["references"] = [
+                {
+                    "relative_path": (
+                        Path(value)
+                        .resolve()
+                        .relative_to(batch.resolve())
+                        .as_posix()
+                    ),
+                    "semantic_name": f"目标素材角色{index}",
+                }
+                for index, value in enumerate(images, start=1)
+            ]
+            loop.atomic_write_json(batch / "job-bindings.json", binding_payload)
+        semantic_names = [
+            str(item["semantic_name"]) for item in binding_job["references"]
+        ]
+        if not loop.job_requirement_lines(batch, job_id):
+            with (batch / "requirements.txt").open("a", encoding="utf-8") as handle:
+                handle.write(f"{job_id}：执行测试替换并保持原动作。\n")
+        if semantic_names:
+            applicable = "\n".join(loop.job_requirement_lines(batch, job_id))
+            missing_handles = [
+                f"@图片{index}"
+                for index in range(1, len(semantic_names) + 1)
+                if f"@图片{index}" not in applicable
+            ]
+            if missing_handles:
+                with (batch / "requirements.txt").open(
+                    "a", encoding="utf-8"
+                ) as handle:
+                    handle.write(
+                        f"{job_id}：分别使用{'、'.join(missing_handles)}"
+                        "完成各自指定替换。\n"
+                    )
         output = (
             project_root
             / "outputs"
@@ -190,24 +266,30 @@ class VideoBatchLoopTest(unittest.TestCase):
             source.write_bytes(indexed_source.read_bytes())
         if images:
             bindings = "；".join(
-                f"@图片{index}=目标素材角色{index}"
-                for index in range(1, len(images) + 1)
+                f"@图片{index}={name}"
+                for index, name in enumerate(semantic_names, start=1)
             )
-            prompt.write_text(
+            node_prompt = (
                 f"素材绑定：@视频1=原视频；{bindings}。\n"
-                "最高优先级：使用上述素材名称完成指定替换。\n"
                 "镜头1（0.0-1.0s）\n"
-                "将指定对象替换为绑定素材。\n",
-                encoding="utf-8",
+                f"将指定对象分别替换为{'、'.join(semantic_names)}。\n"
             )
         else:
-            prompt.write_text(
+            node_prompt = (
                 "素材绑定：@视频1=原视频。\n"
-                "最高优先级：执行指定替换并保持其余源片事实。\n"
                 "镜头1（0.0-1.0s）\n"
-                "执行指定替换。\n",
-                encoding="utf-8",
+                "执行指定替换。\n"
             )
+        prompt.write_text(
+            loop.compose_execution_prompt(
+                batch,
+                job_id,
+                binding_job["references"],
+                node_prompt,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         preflight = {
             "preflight_passed": True,
             "transport": executor.transport,
@@ -299,6 +381,102 @@ class VideoBatchLoopTest(unittest.TestCase):
         (refs / "nested" / "客户 A.jpg").write_bytes(b"duplicate")
         with self.assertRaises(loop.LoopError):
             loop.build_reference_index(destination)
+
+    def test_check_validates_unfrozen_reference_index_in_memory_without_writing(self):
+        batch = self.prepare("check-before-reference-index")
+        self.upgrade_bindings_to_schema_v3(batch)
+        (batch / "requirements.txt").write_text(
+            "默认：保持原动作并替换产品\n", encoding="utf-8"
+        )
+        (batch / "reference-index.json").unlink()
+
+        returncode = loop.main(
+            [
+                "--root", str(self.root),
+                "--project-root", str(self.project),
+                "--min-free-gib", "0",
+                "check", batch.name,
+            ]
+        )
+
+        self.assertEqual(returncode, 0)
+        self.assertFalse((batch / "reference-index.json").exists())
+
+    def test_check_rejects_new_schema_v2_without_freezing_indexes(self):
+        batch = self.prepare("check-rejects-schema-v2")
+        (batch / "requirements.txt").write_text(
+            "默认：保持原动作并替换产品\n", encoding="utf-8"
+        )
+        (batch / "reference-index.json").unlink()
+
+        returncode = loop.main(
+            [
+                "--root", str(self.root),
+                "--project-root", str(self.project),
+                "--min-free-gib", "0",
+                "check", batch.name,
+            ]
+        )
+
+        self.assertEqual(returncode, 1)
+        self.assertFalse((batch / "reference-index.json").exists())
+        self.assertFalse(
+            (batch / loop.SOURCE_EVIDENCE_INDEX_FILENAME).exists()
+        )
+
+    def test_failed_new_flow_validation_does_not_freeze_any_index(self):
+        batch = self.prepare("inspect-rejects-schema-v2")
+        (batch / "requirements.txt").write_text(
+            "默认：保持原动作并替换产品\n", encoding="utf-8"
+        )
+        (batch / "reference-index.json").unlink()
+        (batch / "PAUSE").write_text("local-only\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(loop.LoopError, "schema_version 3"):
+            loop.inspect_streaming_flow(
+                batch,
+                self.root,
+                self.project,
+                preparation_only=True,
+                minimum_free_bytes=0,
+            )
+
+        self.assertFalse((batch / "reference-index.json").exists())
+        self.assertFalse(
+            (batch / loop.SOURCE_EVIDENCE_INDEX_FILENAME).exists()
+        )
+
+    def test_partial_source_cache_does_not_strand_unfrozen_reference_index(self):
+        batch = self.prepare("partial-source-cache-is-restartable")
+        (batch / "reference-index.json").unlink()
+        cache = (
+            batch
+            / "streaming-results"
+            / "source-evidence"
+            / ("a" * 64)
+        )
+        cache.mkdir(parents=True)
+        loop.atomic_write_json(cache / "manifest.json", {"partial": True})
+
+        self.assertFalse(loop._has_frozen_streaming_artifacts(batch))
+        provisional = loop.reference_index_for_validation(
+            batch, persist_if_unfrozen=False
+        )
+        self.assertEqual(provisional["batch_id"], batch.name)
+        self.assertFalse((batch / "reference-index.json").exists())
+
+    def test_frozen_flow_missing_reference_index_is_not_silently_rebuilt(self):
+        batch, _flow = self.streaming_batch()
+        (batch / "reference-index.json").unlink()
+
+        with self.assertRaisesRegex(loop.LoopError, "冻结.*reference-index"):
+            loop.inspect_streaming_flow(
+                batch,
+                self.root,
+                self.project,
+                minimum_free_bytes=0,
+            )
+        self.assertFalse((batch / "reference-index.json").exists())
 
     def test_requirements_coverage_default_missing_and_unknown(self):
         destination = self.prepare()
@@ -588,6 +766,8 @@ class VideoBatchLoopTest(unittest.TestCase):
         self.assertEqual(len(process_records), 2)
         for process_path in process_records:
             process = json.loads(process_path.read_text(encoding="utf-8"))
+            self.assertEqual(process["phase"], "SUCCEEDED")
+            self.assertIn("result_validated_at", process)
             self.assertEqual(process["execution_environment"], "none")
             self.assertEqual(process["writable_workspace_paths"], [])
             self.assertTrue(process["shell_tools_disabled"])
@@ -661,6 +841,14 @@ class VideoBatchLoopTest(unittest.TestCase):
         self.assertEqual(record["job_ids"], ["V001"])
         self.assertIn("started_at", record)
         self.assertIn("finished_at", record)
+        self.assertEqual(record["phase"], "TIMED_OUT")
+        self.assertIn("queued_at", record)
+        self.assertIn("lock_acquired_at", record)
+        self.assertIn("exec_started_at", record)
+        self.assertIn("exec_finished_at", record)
+        self.assertIsInstance(record["auth_lock_wait_seconds"], float)
+        self.assertIsInstance(record["exec_seconds"], float)
+        self.assertIsInstance(record["total_seconds"], float)
         self.assertFalse((records[0].parent / "codex-result.json").exists())
 
     def test_node_exec_timeout_environment_must_be_a_positive_integer(self):
@@ -679,6 +867,183 @@ class VideoBatchLoopTest(unittest.TestCase):
             ):
                 with self.assertRaises(loop.LoopError):
                     loop._node_exec_timeout_seconds()
+
+    def test_zero_exit_with_missing_or_invalid_result_is_not_recorded_as_success(self):
+        for label, result_text, expected_phase, error_pattern in (
+            ("missing", None, "RESULT_MISSING", "没有生成节点结果"),
+            ("invalid", "not-json", "RESULT_INVALID", "不是有效 JSON"),
+            ("array", "[]", "RESULT_INVALID", "不是 JSON 对象"),
+        ):
+            with self.subTest(label=label):
+                batch = self.root / "ready" / f"node-result-{label}"
+                batch.mkdir(parents=True)
+                state_dir = self.temp / f"external-result-{label}-state"
+                codex_home = self.codex_node_home(state_dir)
+
+                def fake_run(command, *_args, **_kwargs):
+                    if result_text is not None:
+                        output = Path(
+                            command[command.index("--output-last-message") + 1]
+                        )
+                        output.write_text(result_text, encoding="utf-8")
+                    return SimpleNamespace(returncode=0)
+
+                with mock.patch.object(
+                    loop,
+                    "find_codex",
+                    return_value="codex-test.exe" if os.name == "nt" else "codex-test",
+                ), mock.patch.object(
+                    loop,
+                    "verify_windows_codex",
+                    return_value={"binary": Path("codex-test.exe")},
+                ), mock.patch.object(
+                    loop, "executor_state_dir", return_value=state_dir
+                ), mock.patch.object(
+                    loop, "validate_node_home", return_value=codex_home
+                ), mock.patch.object(
+                    loop, "locked_node_home", return_value=mock.MagicMock()
+                ), mock.patch.object(loop.subprocess, "run", side_effect=fake_run):
+                    with self.assertRaisesRegex(loop.LoopError, error_pattern):
+                        loop._run_codex_exec(
+                            batch,
+                            self.root,
+                            self.project,
+                            "node prompt",
+                            schema_path=SCHEMA_PATH,
+                            job_ids=["V001"],
+                        )
+
+                records = list(
+                    batch.glob(
+                        "streaming-results/agents/V001-prepare/*/codex-process.json"
+                    )
+                )
+                self.assertEqual(len(records), 1)
+                record = json.loads(records[0].read_text())
+                self.assertEqual(record["phase"], expected_phase)
+                self.assertNotEqual(record["phase"], "SUCCEEDED")
+                self.assertIn("error", record)
+
+    def test_node_home_setup_failure_writes_terminal_process_record(self):
+        batch = self.root / "ready" / "node-home-setup-failure"
+        batch.mkdir(parents=True)
+        state_dir = self.temp / "external-setup-failure-state"
+        with mock.patch.object(
+            loop, "executor_state_dir", return_value=state_dir
+        ), mock.patch.object(
+            loop,
+            "validate_node_home",
+            side_effect=loop.CodexNodeHomeError("fixture node home invalid"),
+        ):
+            with self.assertRaisesRegex(loop.LoopError, "node home invalid"):
+                loop._run_codex_exec(
+                    batch,
+                    self.root,
+                    self.project,
+                    "node prompt",
+                    schema_path=SCHEMA_PATH,
+                    job_ids=["V001"],
+                )
+        records = list(
+            batch.glob("streaming-results/agents/V001-prepare/*/codex-process.json")
+        )
+        self.assertEqual(len(records), 1)
+        record = json.loads(records[0].read_text())
+        self.assertEqual(record["phase"], "SETUP_FAILED")
+        self.assertIn("fixture node home invalid", record["error"])
+
+    def test_node_prompt_and_attachment_setup_failures_are_terminal(self):
+        cases = (
+            ("empty-prompt", "   ", (), "节点 prompt 为空"),
+            (
+                "missing-attachment",
+                "node prompt",
+                (Path("missing.jpg"),),
+                "节点附加图片不存在",
+            ),
+        )
+        for label, prompt, attachments, error_pattern in cases:
+            with self.subTest(label=label):
+                batch = self.root / "ready" / f"node-setup-{label}"
+                batch.mkdir(parents=True)
+                state_dir = self.temp / f"external-{label}-state"
+                codex_home = self.codex_node_home(state_dir)
+                with mock.patch.object(
+                    loop, "executor_state_dir", return_value=state_dir
+                ), mock.patch.object(
+                    loop, "validate_node_home", return_value=codex_home
+                ):
+                    with self.assertRaisesRegex(loop.LoopError, error_pattern):
+                        loop._run_codex_exec(
+                            batch,
+                            self.root,
+                            self.project,
+                            prompt,
+                            schema_path=SCHEMA_PATH,
+                            job_ids=["V001"],
+                            attached_workspace_images=attachments,
+                        )
+                records = list(
+                    batch.glob(
+                        "streaming-results/agents/V001-prepare/*/codex-process.json"
+                    )
+                )
+                self.assertEqual(len(records), 1)
+                record = json.loads(records[0].read_text(encoding="utf-8"))
+                self.assertEqual(record["phase"], "SETUP_FAILED")
+                self.assertIn("finished_at", record)
+                self.assertIn(error_pattern, record["error"])
+
+    def test_node_auth_lock_failure_is_recorded_before_subprocess(self):
+        batch = self.root / "ready" / "node-lock-failure"
+        batch.mkdir(parents=True)
+        state_dir = self.temp / "external-lock-failure-state"
+        codex_home = self.codex_node_home(state_dir)
+
+        @contextmanager
+        def fail_lock(*_args, **_kwargs):
+            raise loop.CodexNodeHomeError("fixture auth lock timeout")
+            yield
+
+        with mock.patch.object(
+            loop,
+            "find_codex",
+            return_value="codex-test.exe" if os.name == "nt" else "codex-test",
+        ), mock.patch.object(
+            loop,
+            "verify_windows_codex",
+            return_value={"binary": Path("codex-test.exe")},
+        ), mock.patch.object(
+            loop, "executor_state_dir", return_value=state_dir
+        ), mock.patch.object(
+            loop, "validate_node_home", return_value=codex_home
+        ), mock.patch.object(
+            loop, "locked_node_home", side_effect=fail_lock
+        ), mock.patch.object(loop.subprocess, "run") as run:
+            with self.assertRaisesRegex(loop.LoopError, "auth lock timeout"):
+                loop._run_codex_exec(
+                    batch,
+                    self.root,
+                    self.project,
+                    "node prompt",
+                    schema_path=SCHEMA_PATH,
+                    job_ids=["V001"],
+                    stage="prepare",
+                )
+
+        run.assert_not_called()
+        records = list(
+            batch.glob(
+                "streaming-results/agents/V001-prepare/*/codex-process.json"
+            )
+        )
+        self.assertEqual(len(records), 1)
+        record = json.loads(records[0].read_text(encoding="utf-8"))
+        self.assertEqual(record["phase"], "LOCK_FAILED")
+        self.assertIsNone(record["lock_acquired_at"])
+        self.assertIsNone(record["exec_started_at"])
+        self.assertEqual(record["exec_seconds"], 0.0)
+        self.assertIn("fixture auth lock timeout", record["error"])
 
     def test_windows_prompt_node_requires_native_exe_without_shell_wrappers(self):
         for wrapper in (
@@ -1198,7 +1563,7 @@ class VideoBatchLoopTest(unittest.TestCase):
         )
         loop.validate_execution_prompt(prompt)
 
-    def test_prompt_gate_requires_one_decimal_timecodes(self):
+    def test_prompt_gate_allows_nonblocking_timecode_variation(self):
         prompt = self.temp / "invalid-shot-writing.txt"
         prompt.write_text(
             "素材绑定：@视频1=原视频。\n"
@@ -1207,9 +1572,7 @@ class VideoBatchLoopTest(unittest.TestCase):
             "其余画面信息保持原视频本镜头不变。\n",
             encoding="utf-8",
         )
-        with self.assertRaisesRegex(loop.LoopError, "时间格式必须为") as caught:
-            loop.validate_execution_prompt(prompt, reference_count=0)
-        self.assertNotIn("通用全量保持清单", str(caught.exception))
+        loop.validate_execution_prompt(prompt, reference_count=0)
 
     def test_prompt_gate_accepts_plain_shot_change_paragraph(self):
         prompt = self.temp / "inline-shot-writing.txt"
@@ -1221,7 +1584,7 @@ class VideoBatchLoopTest(unittest.TestCase):
         )
         loop.validate_execution_prompt(prompt, reference_count=0)
 
-    def test_prompt_gate_rejects_overbroad_unchanged_inventory(self):
+    def test_prompt_gate_allows_nonblocking_overbroad_prose(self):
         prompt = self.temp / "legacy-keep-shot-writing.txt"
         prompt.write_text(
             "素材绑定：@视频1=原视频。\n"
@@ -1232,8 +1595,7 @@ class VideoBatchLoopTest(unittest.TestCase):
             "保持原有光线、曝光和明暗变化逻辑不变。\n",
             encoding="utf-8",
         )
-        with self.assertRaisesRegex(loop.LoopError, "通用全量保持清单"):
-            loop.validate_execution_prompt(prompt, reference_count=0)
+        loop.validate_execution_prompt(prompt, reference_count=0)
 
     def test_prompt_gate_accepts_explicit_removal_instruction(self):
         prompt = self.temp / "negative-absence-instruction.txt"
@@ -1245,7 +1607,7 @@ class VideoBatchLoopTest(unittest.TestCase):
         )
         loop.validate_execution_prompt(prompt, reference_count=0)
 
-    def test_prompt_gate_rejects_offscreen_person_as_a_negative_sentence(self):
+    def test_prompt_gate_allows_nonblocking_negative_sentence(self):
         prompt = self.temp / "offscreen-person-negative.txt"
         prompt.write_text(
             "素材绑定：@视频1=原视频。\n"
@@ -1253,8 +1615,7 @@ class VideoBatchLoopTest(unittest.TestCase):
             "驾驶位女性不进入镜头4；将画面人物替换为副驾驶成年男性和后排年轻女性。\n",
             encoding="utf-8",
         )
-        with self.assertRaisesRegex(loop.LoopError, "未出镜内容写成否定句"):
-            loop.validate_execution_prompt(prompt, reference_count=0)
+        loop.validate_execution_prompt(prompt, reference_count=0)
 
     def test_prompt_reference_alias_gate_accepts_once_binding_and_name_only_body(self):
         prompt = self.temp / "reference-alias-valid.txt"
@@ -1521,6 +1882,7 @@ class VideoBatchLoopTest(unittest.TestCase):
             encoding="utf-8",
         )
         ready = loop.move_batch(batch, self.root, "ready")
+        self.freeze_source_evidence(ready)
         flow = loop.inspect_streaming_flow(
             ready,
             self.root,
@@ -1547,10 +1909,11 @@ class VideoBatchLoopTest(unittest.TestCase):
         bindings["backend_profile"] = "dreamina_cli_seedance_2_5"
         loop.atomic_write_json(batch / "job-bindings.json", bindings)
         (batch / "requirements.txt").write_text(
-            "默认：保持源片动作\nV001：将内饰替换为目标车内饰\n",
+            "默认：保持源片动作\nV001：将内饰替换为@图片1\n",
             encoding="utf-8",
         )
         ready = loop.move_batch(batch, self.root, "ready")
+        self.freeze_source_evidence(ready)
         flow = loop.inspect_streaming_flow(
             ready,
             self.root,
@@ -1628,6 +1991,7 @@ class VideoBatchLoopTest(unittest.TestCase):
         return loop.move_batch(batch, self.root, "ready")
 
     def write_retired_schema_v3_flow(self, batch):
+        self.freeze_source_evidence(batch)
         current = loop.inspect_streaming_flow(
             batch,
             self.root,
@@ -1640,7 +2004,7 @@ class VideoBatchLoopTest(unittest.TestCase):
         )
         self.assertEqual(
             retired_identity["prompt_pipeline"],
-            "video-to-prompt-v2-sampled-readonly",
+            "video-to-prompt-v3-parent-composed",
         )
         retired_identity["prompt_pipeline"] = "video-to-prompt-v1"
         retired_identity["video_to_prompt_contract_sha256"] = "e" * 64
@@ -1835,20 +2199,83 @@ class VideoBatchLoopTest(unittest.TestCase):
         with self.assertRaisesRegex(loop.LoopError, "输入哈希已变化"):
             loop.verify_streaming_flow(batch)
 
-    def test_new_schema_v3_flow_binds_the_sampled_read_only_prompt_pipeline(self):
+    def test_frozen_flow_rejects_any_job_manifest_tampering(self):
+        batch, flow = self.streaming_batch()
+        self.assertEqual(
+            flow["flow_jobs_sha256"],
+            loop._streaming_flow_jobs_sha256(flow["jobs"]),
+        )
+        flow_path = batch / "streaming-flow.json"
+        original = flow_path.read_text(encoding="utf-8")
+        mutations = {
+            "reordered": lambda jobs: jobs.reverse(),
+            "duplicated": lambda jobs: jobs.__setitem__(
+                slice(None), [jobs[0], jobs[0]]
+            ),
+            "filename": lambda jobs: jobs[0].__setitem__("filename", "other.mp4"),
+            "skipped": lambda jobs: jobs[0].__setitem__("skipped", True),
+            "extra-field": lambda jobs: jobs[0].__setitem__("extra", "tampered"),
+        }
+        for entrypoint in ("inspect", "verify"):
+            for label, mutate in mutations.items():
+                with self.subTest(entrypoint=entrypoint, mutation=label):
+                    candidate = json.loads(original)
+                    mutate(candidate["jobs"])
+                    loop.atomic_write_json(flow_path, candidate)
+                    tampered = flow_path.read_text(encoding="utf-8")
+                    with self.assertRaisesRegex(loop.LoopError, "冻结 Job 清单"):
+                        if entrypoint == "inspect":
+                            loop.inspect_streaming_flow(
+                                batch,
+                                self.root,
+                                self.project,
+                                minimum_free_bytes=0,
+                            )
+                        else:
+                            loop.verify_streaming_flow(batch, self.project)
+                    self.assertEqual(flow_path.read_text(encoding="utf-8"), tampered)
+        loop.atomic_write_text(flow_path, original)
+
+    def test_streaming_flow_rejects_sampler_or_ffmpeg_identity_change(self):
+        batch, _flow = self.streaming_batch()
+        with mock.patch.object(
+            loop, "VIDEO_PROMPT_SAMPLER_RECIPE", "changed-sampler-recipe"
+        ):
+            with self.assertRaises(loop.LoopError):
+                loop.verify_streaming_flow(batch, self.project)
+
+        different_tool = self.temp / "different-ffmpeg"
+        different_tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        different_tool.chmod(0o755)
+        with mock.patch.object(
+            loop, "_trusted_ffmpeg_executable", return_value=different_tool
+        ):
+            with self.assertRaisesRegex(loop.LoopError, "工具不匹配"):
+                loop.verify_streaming_flow(batch, self.project)
+
+    def test_new_schema_v3_flow_binds_the_parent_composed_prompt_pipeline(self):
         batch = self.schema_v3_ready_batch("schema-v3-new-prompt-pipeline")
+        self.freeze_source_evidence(batch)
         index, reference_index = loop.verify_batch_integrity(batch)
         identity = loop._streaming_flow_identity(
             batch, self.project, index, reference_index
         )
 
         self.assertEqual(
-            identity["prompt_pipeline"], "video-to-prompt-v2-sampled-readonly"
+            identity["prompt_pipeline"], "video-to-prompt-v3-parent-composed"
         )
         self.assertEqual(identity["video_to_prompt_model"], "gpt-5.6-terra")
         self.assertEqual(
             identity["video_to_prompt_contract_sha256"],
             loop.sha256_file(loop.node_contract_path("video-to-prompt.md")),
+        )
+        self.assertEqual(
+            identity["source_evidence_index_sha256"],
+            loop.sha256_file(batch / loop.SOURCE_EVIDENCE_INDEX_FILENAME),
+        )
+        self.assertEqual(
+            identity["source_evidence_sampler_recipe"],
+            loop.VIDEO_PROMPT_SAMPLER_RECIPE,
         )
         expected_fingerprint = loop._streaming_flow_fingerprint(identity)
         flow = loop.inspect_streaming_flow(
@@ -1862,7 +2289,7 @@ class VideoBatchLoopTest(unittest.TestCase):
         )
 
         self.assertEqual(
-            flow["prompt_pipeline"], "video-to-prompt-v2-sampled-readonly"
+            flow["prompt_pipeline"], "video-to-prompt-v3-parent-composed"
         )
         self.assertEqual(flow["video_to_prompt_model"], "gpt-5.6-terra")
         self.assertEqual(
@@ -1871,7 +2298,7 @@ class VideoBatchLoopTest(unittest.TestCase):
         )
         self.assertEqual(flow["flow_fingerprint"], expected_fingerprint)
         self.assertEqual(
-            persisted["prompt_pipeline"], "video-to-prompt-v2-sampled-readonly"
+            persisted["prompt_pipeline"], "video-to-prompt-v3-parent-composed"
         )
         self.assertEqual(
             loop.verify_streaming_flow(batch)["flow_fingerprint"],
@@ -1896,6 +2323,7 @@ class VideoBatchLoopTest(unittest.TestCase):
                     batch = self.schema_v3_ready_batch(
                         f"schema-v3-{mutation_name}-{entrypoint}"
                     )
+                    self.freeze_source_evidence(batch)
                     flow = loop.inspect_streaming_flow(
                         batch,
                         self.root,
@@ -2003,6 +2431,12 @@ class VideoBatchLoopTest(unittest.TestCase):
         with mock.patch.object(
             loop, "verify_streaming_flow", return_value=flow
         ), mock.patch.object(
+            loop,
+            "_read_streaming_job_result",
+            side_effect=lambda _batch, _stage, job_id, _fingerprint: {
+                "job": {"id": job_id, "status": loop.PREPARED_STATUS}
+            },
+        ), mock.patch.object(
             loop, "load_submission_plan", return_value={}
         ) as load_plan:
             result = loop.preflight_streaming_submission(
@@ -2019,6 +2453,32 @@ class VideoBatchLoopTest(unittest.TestCase):
         )
         for call in load_plan.call_args_list:
             self.assertEqual(call.kwargs["max_batch_videos"], 7)
+
+    def test_partial_local_preparation_is_blocked_before_payment_approval(self):
+        batch = self.root / "needs-input" / "partial-local-preparation"
+        batch.mkdir(parents=True)
+        flow = {
+            "flow_fingerprint": "f" * 64,
+            "jobs": [{"id": "V001"}, {"id": "V002"}],
+        }
+        jobs = [
+            {"id": "V001", "status": loop.PREPARED_STATUS},
+            {"id": "V002", "status": "BLOCKED", "blocker": "retry me"},
+        ]
+
+        with mock.patch.object(
+            loop, "verify_streaming_flow", return_value=flow
+        ), mock.patch.object(
+            loop, "_collect_streaming_preparation", return_value=jobs
+        ):
+            result = loop.finalize_streaming_preparation(batch, self.project)
+
+        self.assertEqual(result["batch_status"], "PARTIAL")
+        self.assertEqual(result["workflow_state"], "LOCAL_PREPARATION_BLOCKED")
+        self.assertFalse(result["payment_approval_required"])
+        state = json.loads((batch / "loop-state.json").read_text())
+        self.assertEqual(state["state"], "LOCAL_PREPARATION_BLOCKED")
+        self.assertFalse(state["payment_approval_required"])
 
     def test_submission_preflight_blocks_if_any_eligible_plan_is_invalid(self):
         flow = {
@@ -2042,6 +2502,12 @@ class VideoBatchLoopTest(unittest.TestCase):
         with mock.patch.object(
             loop, "verify_streaming_flow", return_value=flow
         ), mock.patch.object(
+            loop,
+            "_read_streaming_job_result",
+            side_effect=lambda _batch, _stage, job_id, _fingerprint: {
+                "job": {"id": job_id, "status": loop.PREPARED_STATUS}
+            },
+        ), mock.patch.object(
             loop, "load_submission_plan", side_effect=load_plan
         ) as mocked_load_plan:
             with self.assertRaisesRegex(loop.LoopError, "V002.*无效"):
@@ -2049,8 +2515,440 @@ class VideoBatchLoopTest(unittest.TestCase):
 
         self.assertEqual(
             [call.args[2] for call in mocked_load_plan.call_args_list],
-            ["V001", "V002"],
+            ["V001", "V002", "V003"],
         )
+
+    def test_stale_ready_plan_is_demoted_and_payment_state_is_cleared(self):
+        batch, flow = self.streaming_batch()
+        ready_job = {
+            "id": "V001",
+            "status": loop.PREPARED_STATUS,
+            "task_id": None,
+            "output_path": None,
+            "blocker": None,
+        }
+        self.write_streaming_result(batch, flow, "preparation", ready_job)
+        loop.atomic_write_json(
+            batch / "loop-state.json",
+            {
+                "batch_id": batch.name,
+                "state": "LOCAL_PREPARED_AWAITING_APPROVAL",
+                "flow_fingerprint": flow["flow_fingerprint"],
+                "payment_approval_required": True,
+            },
+        )
+
+        with mock.patch.object(
+            loop,
+            "load_submission_plan",
+            side_effect=loop.LoopError("submission plan missing"),
+        ), mock.patch.object(loop, "run_video_to_prompt_node") as node:
+            result = loop.prepare_streaming_job(
+                batch,
+                self.root,
+                self.project,
+                "V001",
+                executor=self.executor,
+            )
+
+        self.assertEqual(result["job"]["status"], "BLOCKED")
+        self.assertIn("submission plan missing", result["job"]["blocker"])
+        self.assertEqual(
+            result["invalidated_prepared_job"]["status"], loop.PREPARED_STATUS
+        )
+        persisted = json.loads(
+            loop._streaming_job_result_path(
+                batch, "preparation", "V001"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(persisted["job"]["status"], "BLOCKED")
+        state = json.loads((batch / "loop-state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["state"], "LOCAL_PREPARATION_BLOCKED")
+        self.assertFalse(state["payment_approval_required"])
+        self.assertFalse((batch / "payment-checkpoint.json").exists())
+        node.assert_not_called()
+
+    def test_preflight_plan_race_demotes_ready_result_and_finalizes_blocked(self):
+        batch, flow = self.streaming_batch()
+        for job_id in ("V001", "V002"):
+            self.write_streaming_result(
+                batch,
+                flow,
+                "preparation",
+                {
+                    "id": job_id,
+                    "status": loop.PREPARED_STATUS,
+                    "task_id": None,
+                    "output_path": None,
+                    "blocker": None,
+                },
+            )
+        loop.atomic_write_json(
+            batch / "loop-state.json",
+            {
+                "batch_id": batch.name,
+                "state": "LOCAL_PREPARED_AWAITING_APPROVAL",
+                "flow_fingerprint": flow["flow_fingerprint"],
+                "payment_approval_required": True,
+            },
+        )
+
+        def load_plan(_batch, _project_root, job_id, **_kwargs):
+            if job_id == "V001":
+                raise loop.LoopError("submission plan changed after preparation")
+            return {}
+
+        with mock.patch.object(loop, "load_submission_plan", side_effect=load_plan):
+            with self.assertRaisesRegex(loop.LoopError, "V001.*计划复核失败"):
+                loop.preflight_streaming_submission(batch, self.project)
+
+        persisted = json.loads(
+            loop._streaming_job_result_path(
+                batch, "preparation", "V001"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(persisted["job"]["status"], "BLOCKED")
+        state = json.loads((batch / "loop-state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["state"], "LOCAL_PREPARATION_BLOCKED")
+        self.assertFalse(state["payment_approval_required"])
+        self.assertFalse((batch / "payment-checkpoint.json").exists())
+
+    def test_submission_preflight_rejects_stale_plan_when_canonical_preparation_is_blocked(self):
+        flow = {
+            "schema_version": 1,
+            "batch_id": "preflight-stale-plan",
+            "flow_fingerprint": "c" * 64,
+            "jobs": [{"id": "V001", "skipped": False}],
+        }
+        batch = self.root / "ready" / flow["batch_id"]
+        batch.mkdir(parents=True)
+        blocked = {
+            "schema_version": 1,
+            "batch_id": batch.name,
+            "job_id": "V001",
+            "flow_fingerprint": flow["flow_fingerprint"],
+            "updated_at": loop.utc_now(),
+            "job": {
+                "id": "V001",
+                "status": "BLOCKED",
+                "task_id": None,
+                "output_path": None,
+                "blocker": "latest attempt failed",
+            },
+        }
+
+        with mock.patch.object(
+            loop, "verify_streaming_flow", return_value=flow
+        ), mock.patch.object(
+            loop, "_read_streaming_job_result", return_value=blocked
+        ), mock.patch.object(
+            loop, "load_submission_plan", return_value={}
+        ) as load_plan:
+            with self.assertRaisesRegex(loop.LoopError, "V001.*BLOCKED"):
+                loop.preflight_streaming_submission(batch, self.project)
+
+        load_plan.assert_not_called()
+
+    def test_retry_prepare_archives_blocked_attempt_and_reruns_only_target(self):
+        batch = self.prepare("retry-local-blocked")
+        self.upgrade_bindings_to_schema_v3(batch)
+        (batch / "requirements.txt").write_text(
+            "默认：替换产品\n", encoding="utf-8"
+        )
+        (batch / "PAUSE").write_text("local-only\n", encoding="utf-8")
+        self.freeze_source_evidence(batch)
+        flow = loop.inspect_streaming_flow(
+            batch,
+            self.root,
+            self.project,
+            preparation_only=True,
+            minimum_free_bytes=0,
+        )
+        old_result = {
+            "schema_version": 1,
+            "batch_id": batch.name,
+            "job_id": "V001",
+            "flow_fingerprint": flow["flow_fingerprint"],
+            "updated_at": loop.utc_now(),
+            "job": {
+                "id": "V001",
+                "status": "BLOCKED",
+                "task_id": None,
+                "output_path": None,
+                "blocker": "transient local failure",
+            },
+        }
+        result_path = loop._streaming_job_result_path(
+            batch, "preparation", "V001"
+        )
+        loop.atomic_write_json(result_path, old_result)
+        retried = dict(old_result)
+        retried["job"] = dict(
+            old_result["job"], status=loop.PREPARED_STATUS, blocker=None
+        )
+
+        with mock.patch.object(
+            loop, "verify_streaming_flow", return_value=flow
+        ), mock.patch.object(
+            loop, "recorded_task_id", return_value=None
+        ), mock.patch.object(
+            loop, "prepare_streaming_job", return_value=retried
+        ) as prepare_job:
+            result = loop.retry_streaming_preparation_job(
+                batch, self.root, self.project, "V001"
+            )
+
+        self.assertEqual(result["job"]["status"], loop.PREPARED_STATUS)
+        prepare_job.assert_called_once()
+        self.assertTrue(result_path.is_file())
+        self.assertEqual(json.loads(result_path.read_text()), retried)
+        history = list(
+            (batch / "streaming-results" / "preparation-history" / "V001").glob(
+                "attempt-*.json"
+            )
+        )
+        self.assertEqual(len(history), 1)
+        self.assertEqual(json.loads(history[0].read_text()), old_result)
+
+    def test_retry_prepare_restores_canonical_result_when_rerun_raises(self):
+        batch = self.root / "needs-input" / "retry-transaction-restore"
+        batch.mkdir(parents=True)
+        (batch / "PAUSE").write_text("local-only\n", encoding="utf-8")
+        flow = {
+            "schema_version": 1,
+            "batch_id": batch.name,
+            "flow_fingerprint": "a" * 64,
+            "jobs": [{"id": "V001", "skipped": False}],
+        }
+        old_result = {
+            "schema_version": 1,
+            "batch_id": batch.name,
+            "job_id": "V001",
+            "flow_fingerprint": flow["flow_fingerprint"],
+            "updated_at": loop.utc_now(),
+            "job": {
+                "id": "V001",
+                "status": "BLOCKED",
+                "task_id": None,
+                "output_path": None,
+                "blocker": "transient local failure",
+            },
+        }
+        result_path = loop._streaming_job_result_path(
+            batch, "preparation", "V001"
+        )
+        loop.atomic_write_json(result_path, old_result)
+
+        with mock.patch.object(
+            loop, "verify_streaming_flow", return_value=flow
+        ), mock.patch.object(
+            loop, "recorded_task_id", return_value=None
+        ), mock.patch.object(
+            loop,
+            "prepare_streaming_job",
+            side_effect=RuntimeError("unexpected rerun crash"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "unexpected rerun crash"):
+                loop.retry_streaming_preparation_job(
+                    batch, self.root, self.project, "V001"
+                )
+
+        self.assertEqual(json.loads(result_path.read_text()), old_result)
+        history = list(
+            (batch / "streaming-results" / "preparation-history" / "V001").glob(
+                "attempt-*.json"
+            )
+        )
+        self.assertEqual(len(history), 1)
+        self.assertEqual(json.loads(history[0].read_text()), old_result)
+
+    def test_retry_prepare_can_rebuild_ready_job_with_invalid_plan(self):
+        batch = self.root / "needs-input" / "retry-stale-ready-plan"
+        batch.mkdir(parents=True)
+        (batch / "PAUSE").write_text("local-only\n", encoding="utf-8")
+        flow = {
+            "schema_version": 1,
+            "batch_id": batch.name,
+            "flow_fingerprint": "b" * 64,
+            "jobs": [{"id": "V001", "skipped": False}],
+        }
+        ready = {
+            "schema_version": 1,
+            "batch_id": batch.name,
+            "job_id": "V001",
+            "flow_fingerprint": flow["flow_fingerprint"],
+            "updated_at": loop.utc_now(),
+            "job": {
+                "id": "V001",
+                "status": loop.PREPARED_STATUS,
+                "task_id": None,
+                "output_path": None,
+                "blocker": None,
+            },
+        }
+        result_path = loop._streaming_job_result_path(
+            batch, "preparation", "V001"
+        )
+        loop.atomic_write_json(result_path, ready)
+        rebuilt = dict(ready)
+
+        with mock.patch.object(
+            loop, "verify_streaming_flow", return_value=flow
+        ), mock.patch.object(
+            loop,
+            "load_submission_plan",
+            side_effect=loop.LoopError("submission plan missing"),
+        ), mock.patch.object(
+            loop, "recorded_task_id", return_value=None
+        ), mock.patch.object(
+            loop, "prepare_streaming_job", return_value=rebuilt
+        ) as prepare_job:
+            result = loop.retry_streaming_preparation_job(
+                batch, self.root, self.project, "V001"
+            )
+
+        self.assertEqual(result, rebuilt)
+        prepare_job.assert_called_once()
+        self.assertTrue(result_path.is_file())
+        history = list(
+            (batch / "streaming-results" / "preparation-history" / "V001").glob(
+                "attempt-*.json"
+            )
+        )
+        self.assertEqual(len(history), 1)
+        self.assertEqual(json.loads(history[0].read_text()), ready)
+
+    def test_retry_prepare_rejects_ready_or_paid_evidence(self):
+        batch = self.root / "needs-input" / "retry-refusals"
+        batch.mkdir(parents=True)
+        (batch / "PAUSE").write_text("local-only\n", encoding="utf-8")
+        flow = {
+            "schema_version": 1,
+            "batch_id": batch.name,
+            "flow_fingerprint": "d" * 64,
+            "jobs": [{"id": "V001", "skipped": False}],
+        }
+        result_path = loop._streaming_job_result_path(
+            batch, "preparation", "V001"
+        )
+
+        def write_status(status):
+            loop.atomic_write_json(
+                result_path,
+                {
+                    "schema_version": 1,
+                    "batch_id": batch.name,
+                    "job_id": "V001",
+                    "flow_fingerprint": flow["flow_fingerprint"],
+                    "updated_at": loop.utc_now(),
+                    "job": {
+                        "id": "V001",
+                        "status": status,
+                        "task_id": None,
+                        "output_path": None,
+                        "blocker": "failed" if status == "BLOCKED" else None,
+                    },
+                },
+            )
+
+        with mock.patch.object(
+            loop, "verify_streaming_flow", return_value=flow
+        ), mock.patch.object(loop, "load_submission_plan", return_value={}):
+            write_status(loop.PREPARED_STATUS)
+            with self.assertRaisesRegex(loop.LoopError, "提交计划有效"):
+                loop.retry_streaming_preparation_job(
+                    batch, self.root, self.project, "V001"
+                )
+
+            write_status("BLOCKED")
+            submission = batch / "streaming-results" / "submission" / "V001.json"
+            submission.parent.mkdir(parents=True)
+            submission.write_text("{}\n", encoding="utf-8")
+            with mock.patch.object(
+                loop, "recorded_task_id", return_value=None
+            ), self.assertRaisesRegex(loop.LoopError, "提交、付费授权或远端任务"):
+                loop.retry_streaming_preparation_job(
+                    batch, self.root, self.project, "V001"
+                )
+
+        self.assertTrue(result_path.is_file())
+
+    def test_retry_prepare_rejects_paid_evidence_for_any_flow_job(self):
+        flow = {
+            "schema_version": 1,
+            "flow_fingerprint": "e" * 64,
+            "jobs": [
+                {"id": "V001", "skipped": False},
+                {"id": "V002", "skipped": False},
+            ],
+        }
+
+        for kind in ("submission", "checkpoint", "task"):
+            with self.subTest(kind=kind):
+                batch = self.root / "needs-input" / f"retry-paid-{kind}"
+                batch.mkdir(parents=True)
+                (batch / "PAUSE").write_text("local-only\n", encoding="utf-8")
+                flow["batch_id"] = batch.name
+                result_path = loop._streaming_job_result_path(
+                    batch, "preparation", "V001"
+                )
+                loop.atomic_write_json(
+                    result_path,
+                    {
+                        "schema_version": 1,
+                        "batch_id": batch.name,
+                        "job_id": "V001",
+                        "flow_fingerprint": flow["flow_fingerprint"],
+                        "updated_at": loop.utc_now(),
+                        "job": {
+                            "id": "V001",
+                            "status": "BLOCKED",
+                            "task_id": None,
+                            "output_path": None,
+                            "blocker": "local failure",
+                        },
+                    },
+                )
+                if kind == "submission":
+                    submission = (
+                        batch / "streaming-results" / "submission" / "V002.json"
+                    )
+                    submission.parent.mkdir(parents=True)
+                    submission.write_text("{}\n", encoding="utf-8")
+                elif kind == "checkpoint":
+                    (batch / "payment-checkpoint-V002.json").write_text(
+                        "{}\n", encoding="utf-8"
+                    )
+
+                def recorded_task(
+                    _project_root, _batch_name, candidate_job_id
+                ):
+                    if kind == "task" and candidate_job_id == "V002":
+                        return "remote-v002"
+                    return None
+
+                with mock.patch.object(
+                    loop, "verify_streaming_flow", return_value=flow
+                ), mock.patch.object(
+                    loop, "recorded_task_id", side_effect=recorded_task
+                ), mock.patch.object(
+                    loop, "prepare_streaming_job"
+                ) as prepare_job, self.assertRaisesRegex(
+                    loop.LoopError, "提交、付费授权或远端任务"
+                ):
+                    loop.retry_streaming_preparation_job(
+                        batch, self.root, self.project, "V001"
+                    )
+
+                prepare_job.assert_not_called()
+                self.assertFalse(
+                    (
+                        batch
+                        / "streaming-results"
+                        / "preparation-history"
+                        / "V001"
+                    ).exists()
+                )
 
     def test_fully_prepared_retired_schema_v3_flow_is_frozen_and_reused(self):
         batch = self.schema_v3_ready_batch(
@@ -2287,6 +3185,49 @@ class VideoBatchLoopTest(unittest.TestCase):
         )
         self.assertEqual(rewritten["created_at"], reference_index["created_at"])
 
+    def test_reinspection_of_existing_flow_preserves_visible_batch_state(self):
+        batch, flow = self.streaming_batch()
+        state_path = batch / "loop-state.json"
+        prepared_state = {
+            "batch_id": batch.name,
+            "state": "LOCAL_PREPARED_AWAITING_APPROVAL",
+            "updated_at": "2099-01-01T00:00:00+00:00",
+            "flow_fingerprint": flow["flow_fingerprint"],
+            "payment_approval_required": True,
+        }
+        loop.atomic_write_json(state_path, prepared_state)
+        original_bytes = state_path.read_bytes()
+
+        inspected = loop.inspect_streaming_flow(
+            batch,
+            self.root,
+            self.project,
+            minimum_free_bytes=0,
+        )
+
+        self.assertEqual(inspected, flow)
+        self.assertEqual(state_path.read_bytes(), original_bytes)
+
+    def test_streaming_inspection_never_overwrites_changed_frozen_reference_index(self):
+        batch, _flow = self.streaming_batch_with_reference(
+            "frozen-reference-index-change"
+        )
+        index_path = batch / "reference-index.json"
+        original_index = index_path.read_bytes()
+        (batch / "replacements" / "target-interior.png").write_bytes(
+            b"changed-reference"
+        )
+
+        with self.assertRaisesRegex(loop.LoopError, "参考素材在索引后发生变化"):
+            loop.inspect_streaming_flow(
+                batch,
+                self.root,
+                self.project,
+                minimum_free_bytes=0,
+            )
+
+        self.assertEqual(index_path.read_bytes(), original_index)
+
     def test_prepare_streaming_job_is_scoped_and_writes_one_result(self):
         batch, flow = self.streaming_batch()
         child = {
@@ -2304,7 +3245,14 @@ class VideoBatchLoopTest(unittest.TestCase):
         output_dir = loop.job_output_dir(self.project, batch, "V001")
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / loop.PROMPT_FILENAME).write_text(
-            "素材绑定：@视频1=原视频。\n编辑要求：替换人物。\n", encoding="utf-8"
+            loop.compose_execution_prompt(
+                batch,
+                "V001",
+                [],
+                "素材绑定：@视频1=原视频。\n编辑要求：替换人物。\n",
+            )
+            + "\n",
+            encoding="utf-8",
         )
         with mock.patch.object(
             loop, "run_video_to_prompt_node", return_value=child
@@ -2367,8 +3315,14 @@ class VideoBatchLoopTest(unittest.TestCase):
         output_dir.mkdir(parents=True, exist_ok=True)
         references = loop.select_job_reference_records(batch, "V001")
         (output_dir / loop.PROMPT_FILENAME).write_text(
-            "素材绑定：@视频1=原视频；@图片1=目标车内饰。\n"
-            "将汽车内饰替换为目标车内饰。\n",
+            loop.compose_execution_prompt(
+                batch,
+                "V001",
+                references,
+                "素材绑定：@视频1=原视频；@图片1=目标车内饰。\n"
+                "将汽车内饰替换为目标车内饰。\n",
+            )
+            + "\n",
             encoding="utf-8",
         )
 

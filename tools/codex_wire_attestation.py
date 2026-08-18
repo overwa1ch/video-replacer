@@ -35,6 +35,17 @@ FORBIDDEN_AGENT_HINTS = (
     "collaboration tools",
 )
 
+UNAUTHENTICATED_FORBIDDEN_HEADERS = frozenset(
+    {
+        "authorization",
+        "x-api-key",
+        "openai-api-key",
+        "x-openai-api-key",
+        "chatgpt-account-id",
+        "x-openai-actor-authorization",
+    }
+)
+
 TOOL_SCHEMA_TYPES = frozenset(
     {
         "code_interpreter",
@@ -350,10 +361,11 @@ def _validate_captured_request(request: Mapping[str, object]) -> dict[str, objec
     headers = request.get("headers")
     if not isinstance(headers, dict):
         raise CodexWireAttestationError("Codex request headers were unavailable")
-    for name in ("authorization", "x-api-key", "openai-api-key"):
+    for name in UNAUTHENTICATED_FORBIDDEN_HEADERS:
         if name in headers:
             raise CodexWireAttestationError(
-                "Codex sent credentials to the loopback attestation provider"
+                "Codex sent credentials or account-routing headers to the "
+                "loopback attestation provider"
             )
     return {
         "attested": True,
@@ -382,6 +394,10 @@ def _validate_authenticated_captured_request(
         )
     header_names_without_authorization = dict(headers)
     header_names_without_authorization.pop("authorization", None)
+    # ChatGPT file-auth legitimately adds the account routing companion to its
+    # Bearer.  The unauthenticated phase rejects it; the authenticated phase
+    # allows it only after independently proving the Bearer digest below.
+    header_names_without_authorization.pop("chatgpt-account-id", None)
     unauthenticated_view["headers"] = header_names_without_authorization
     _validate_captured_request(unauthenticated_view)
 
@@ -428,7 +444,13 @@ def _capture_prompt_node_request(
     source_environment: Mapping[str, str] | None = None,
     timeout_seconds: int = 30,
 ) -> Mapping[str, object]:
-    """Run the exact production command against a configured loopback provider."""
+    """Run the production command against a configured loopback provider.
+
+    The unauthenticated phase adds one final ephemeral credential-store
+    override.  This preserves the stable CODEX_HOME and production request
+    surface while preventing a logged-in file store from being attached to a
+    provider that explicitly declares ``requires_openai_auth=false``.
+    """
 
     server = _CaptureServer(expected_authorization_digest)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -496,6 +518,16 @@ def _capture_prompt_node_request(
             ]
             exec_index = command.index("exec")
             command[exec_index + 1 : exec_index + 1] = provider
+            if not requires_openai_auth:
+                # Codex 0.147/0.148 can reuse the base file-auth manager for a
+                # custom provider even when requires_openai_auth=false.  Make
+                # the unauthenticated phase fail-safe without changing the
+                # authenticated phase or mutating the stable auth.json.
+                option_index = command.index("--json")
+                command[option_index:option_index] = [
+                    "-c",
+                    'cli_auth_credentials_store="ephemeral"',
+                ]
             child = loop.codex_subprocess_environment(
                 source_environment,
                 codex_home=codex_home,

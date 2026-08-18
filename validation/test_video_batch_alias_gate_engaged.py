@@ -1,13 +1,13 @@
 """Keeps the parent-owned prompt-format Gate from becoming a silent no-op.
 
-`validate_execution_prompt(prompt_file, reference_count=None)` only runs
-`_validate_reference_alias_contract` when a reference count is supplied. A call
-site that omits it is valid Python, raises nothing, and quietly skips the gate
-that checks the fixed prompt contract — so the failure mode is invisible.
+`validate_execution_prompt` can validate syntax from a reference count alone,
+but only parent-owned semantic names prove that the node kept the declared
+binding and actually used every requested reference in the body. A production
+call site that omits those names quietly weakens the paid-path Gate.
 
-Supplying the parent-owned reference count verifies the complete first-line
-binding and the user-approved multi-shot format. Source facts stay bounded by
-the direct Video-to-Prompt contract; this Gate validates format.
+Supplying the parent-owned reference count and ordered semantic names verifies
+the complete first-line binding and body usage. Shot prose stays under the
+direct Video-to-Prompt contract and is advisory to this paid-path Gate.
 """
 
 import ast
@@ -49,9 +49,9 @@ class AliasGateEngagedTest(unittest.TestCase):
             with self.assertRaisesRegex(self.loop.LoopError, "每张有序参考图"):
                 self.loop.validate_execution_prompt(prompt, reference_count=2)
 
-    def test_every_call_site_supplies_a_reference_count(self) -> None:
+    def test_every_production_call_site_supplies_parent_semantic_names(self) -> None:
         tree = ast.parse(LOOP_PATH.read_text(encoding="utf-8"))
-        bare = []
+        weak = []
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -59,18 +59,19 @@ class AliasGateEngagedTest(unittest.TestCase):
             name = getattr(target, "id", None) or getattr(target, "attr", None)
             if name != "validate_execution_prompt":
                 continue
-            supplied = {kw.arg for kw in node.keywords} | {
-                "positional" for _ in node.args[1:]
-            }
-            if not ({"reference_count", "positional"} & supplied):
-                bare.append(node.lineno)
+            supplied = {kw.arg for kw in node.keywords}
+            if not {
+                "expected_reference_names",
+                "expected_requirement_lines",
+            }.issubset(supplied):
+                weak.append(node.lineno)
         self.assertEqual(
-            bare,
+            weak,
             [],
-            f"{LOOP_PATH.name} calls validate_execution_prompt without a "
-            f"reference count at line(s) {bare}; the alias gate silently does "
-            "nothing there. The node-refactor branch's call sites are all of "
-            "this shape — porting them verbatim disables validation 266.",
+            f"{LOOP_PATH.name} calls validate_execution_prompt without parent "
+            f"semantic names or immutable requirements at line(s) {weak}; those "
+            "call sites cannot prove that the prompt preserved every hard "
+            "requirement and used every declared reference.",
         )
 
 

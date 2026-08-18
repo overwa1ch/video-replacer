@@ -38,13 +38,26 @@ class WindowsLauncherTests(unittest.TestCase):
 
     def test_router_preserves_space_and_unicode_paths_as_argv(self) -> None:
         root = Path("C:/Users/example/视频 替换仓库")
-        command = launcher.route(["status", "--json"], repo_root=root)
+        command = launcher.route(
+            ["status", "批次 01", "--json"], repo_root=root
+        )
         self.assertEqual(command[0], "node")
         self.assertEqual(command[2:4], ["--project-root", str(root)])
         self.assertEqual(
             command[4:6], ["--root", str(root / "workspace" / "video-loop")]
         )
-        self.assertEqual(command[-2:], ["status", "--json"])
+        self.assertEqual(command[-3:], ["status", "批次 01", "--json"])
+
+    def test_router_rejects_ambiguous_status_arguments(self) -> None:
+        for arguments in (
+            ["status", "batch-a", "batch-b"],
+            ["status", "--json", "--json"],
+            ["status", "--unknown"],
+        ):
+            with self.subTest(arguments=arguments), self.assertRaisesRegex(
+                ValueError, "one optional batch"
+            ):
+                launcher.route(arguments)
 
     def test_router_rejects_infrastructure_overrides(self) -> None:
         for flag in launcher.RESERVED_FLAGS:
