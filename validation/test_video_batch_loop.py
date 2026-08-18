@@ -2873,6 +2873,83 @@ class VideoBatchLoopTest(unittest.TestCase):
 
         self.assertTrue(result_path.is_file())
 
+    def test_retry_prepare_rejects_paid_evidence_for_any_flow_job(self):
+        flow = {
+            "schema_version": 1,
+            "flow_fingerprint": "e" * 64,
+            "jobs": [
+                {"id": "V001", "skipped": False},
+                {"id": "V002", "skipped": False},
+            ],
+        }
+
+        for kind in ("submission", "checkpoint", "task"):
+            with self.subTest(kind=kind):
+                batch = self.root / "needs-input" / f"retry-paid-{kind}"
+                batch.mkdir(parents=True)
+                (batch / "PAUSE").write_text("local-only\n", encoding="utf-8")
+                flow["batch_id"] = batch.name
+                result_path = loop._streaming_job_result_path(
+                    batch, "preparation", "V001"
+                )
+                loop.atomic_write_json(
+                    result_path,
+                    {
+                        "schema_version": 1,
+                        "batch_id": batch.name,
+                        "job_id": "V001",
+                        "flow_fingerprint": flow["flow_fingerprint"],
+                        "updated_at": loop.utc_now(),
+                        "job": {
+                            "id": "V001",
+                            "status": "BLOCKED",
+                            "task_id": None,
+                            "output_path": None,
+                            "blocker": "local failure",
+                        },
+                    },
+                )
+                if kind == "submission":
+                    submission = (
+                        batch / "streaming-results" / "submission" / "V002.json"
+                    )
+                    submission.parent.mkdir(parents=True)
+                    submission.write_text("{}\n", encoding="utf-8")
+                elif kind == "checkpoint":
+                    (batch / "payment-checkpoint-V002.json").write_text(
+                        "{}\n", encoding="utf-8"
+                    )
+
+                def recorded_task(
+                    _project_root, _batch_name, candidate_job_id
+                ):
+                    if kind == "task" and candidate_job_id == "V002":
+                        return "remote-v002"
+                    return None
+
+                with mock.patch.object(
+                    loop, "verify_streaming_flow", return_value=flow
+                ), mock.patch.object(
+                    loop, "recorded_task_id", side_effect=recorded_task
+                ), mock.patch.object(
+                    loop, "prepare_streaming_job"
+                ) as prepare_job, self.assertRaisesRegex(
+                    loop.LoopError, "提交、付费授权或远端任务"
+                ):
+                    loop.retry_streaming_preparation_job(
+                        batch, self.root, self.project, "V001"
+                    )
+
+                prepare_job.assert_not_called()
+                self.assertFalse(
+                    (
+                        batch
+                        / "streaming-results"
+                        / "preparation-history"
+                        / "V001"
+                    ).exists()
+                )
+
     def test_fully_prepared_retired_schema_v3_flow_is_frozen_and_reused(self):
         batch = self.schema_v3_ready_batch(
             "retired-v3-fully-prepared", skip_second=True

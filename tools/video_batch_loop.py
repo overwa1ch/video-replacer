@@ -6594,6 +6594,44 @@ def prepare_streaming_job(
     return result
 
 
+def _retry_prepare_paid_evidence(
+    batch: Path,
+    project_root: Path,
+    flow: Mapping[str, object],
+) -> List[str]:
+    """Return any paid or remote evidence that makes a local retry unsafe."""
+
+    evidence: List[str] = []
+    submission_root = batch / "streaming-results" / "submission"
+    if submission_root.is_dir():
+        evidence.extend(
+            f"submission:{path.name}"
+            for path in sorted(
+                submission_root.glob("*.json"), key=lambda item: item.name
+            )
+            if path.is_file()
+        )
+    evidence.extend(
+        f"payment-checkpoint:{path.name}"
+        for path in sorted(
+            batch.glob("payment-checkpoint*.json"), key=lambda item: item.name
+        )
+        if path.is_file()
+    )
+    jobs = flow.get("jobs")
+    if not isinstance(jobs, list):
+        raise LoopError("streaming flow 缺少 jobs")
+    for item in jobs:
+        if not isinstance(item, dict):
+            raise LoopError("streaming flow 的 job 无效")
+        candidate_job_id = str(item.get("id") or "")
+        if not candidate_job_id:
+            raise LoopError("streaming flow 的 job 缺少 id")
+        if recorded_task_id(project_root, batch.name, candidate_job_id):
+            evidence.append(f"task:{candidate_job_id}")
+    return evidence
+
+
 def retry_streaming_preparation_job(
     batch: Path,
     loop_root: Path,
@@ -6652,20 +6690,10 @@ def retry_streaming_preparation_job(
             f"{job_id} 当前 preparation status 为 {status or 'UNKNOWN'}；"
             "只允许重试 BLOCKED/FAILED，或提交计划已失效的 READY"
         )
-    submission_result = (
-        batch / "streaming-results" / "submission" / f"{job_id}.json"
-    )
-    checkpoint_paths = [
-        batch / "payment-checkpoint.json",
-        batch / f"payment-checkpoint-{job_id}.json",
-    ]
-    if (
-        submission_result.is_file()
-        or any(path.is_file() for path in checkpoint_paths)
-        or recorded_task_id(project_root, batch.name, job_id)
-    ):
+    paid_evidence = _retry_prepare_paid_evidence(batch, project_root, flow)
+    if paid_evidence:
         raise LoopError(
-            f"{job_id} 已存在提交、付费授权或远端任务证据；"
+            f"{job_id} 批次已存在提交、付费授权或远端任务证据（{', '.join(paid_evidence)}）；"
             "拒绝把本地重试与付费恢复混用"
         )
     history_root = (
