@@ -106,7 +106,7 @@ Agent 只提交 `schema_version`、`batch_id`、批次级 `backend_profile`、`j
 
 打码阶段只要求命令成功和输出文件存在。失败时当前 Job 阻塞，原片不会作为上传回退项。流程不检查命中数、画面覆盖度或打码效果。
 
-旧 schema v1/v2 或旧提示词管线只允许恢复全 Job 已完成且提交计划可验证的冻结结果；任何半成品都必须重新整理 schema v3 新批次。重建时逐字复制旧批次的 `requirements.txt` 和未变化绑定，禁止为了通过节点或 Gate 改写硬约束。新 flow 绑定 `video-to-prompt-v3-parent-composed`、固定节点模型与当前节点合同 SHA-256，任一项变化后都拒绝续跑旧 flow。
+旧 schema v1/v2、旧提示词管线，或尚未绑定源证据索引的旧 flow，只允许恢复全 Job 已完成且提交计划可验证的冻结结果；任何半成品都必须重新整理 schema v3 新批次。重建时逐字复制旧批次的 `requirements.txt` 和未变化绑定，禁止为了通过节点或 Gate 改写硬约束。新 flow 绑定 `video-to-prompt-v3-parent-composed`、固定节点模型、当前节点合同 SHA-256、`source-evidence-index.json` SHA-256、取样规则和 FFmpeg 身份，任一项变化后都拒绝续跑旧 flow。
 
 ## 受控 profile 与本地上传准备
 
@@ -146,7 +146,7 @@ Ark adapter 当前只用于内部开发和测试；它没有持久 credential br
 
 ## 单回合抽帧视频到提示词
 
-当前模型回合固定为 sampled Video-to-Prompt。父层先固定当前 Job 需求和有序参考素材绑定，再在本地用受信 FFmpeg 从开头帧起做有界、按时间均匀分布的顺序抽帧。父层校验帧文件、时间顺序、大小与 SHA-256，然后将抽帧、参考图和声明时长/时间戳/需求/绑定的 JSON 作为同一回合输入。抽帧是有界观察证据，不是完整视频语义的保证；无法从已给帧区分必需事实时，回合应返回 `BLOCKED` 而不是猜测。
+当前模型回合固定为 sampled Video-to-Prompt。父层先固定当前 Job 需求和有序参考素材绑定，再在本地用受信 FFmpeg 从开头帧起做有界、按时间均匀分布的顺序抽帧。缓存键同时绑定当前源大小/SHA、取样 recipe 和 FFmpeg 大小/SHA；命中时每个 Job 仍复制为自己的普通文件并重验哈希。参考图、需求、模型回合、prompt Gate、probe 与 submission plan 不复用。父层校验帧文件、时间顺序、大小与 SHA-256，然后将抽帧、参考图和声明时长/时间戳/需求/绑定的 JSON 作为同一回合输入。抽帧是有界观察证据，不是完整视频语义的保证；无法从已给帧区分必需事实时，回合应返回 `BLOCKED` 而不是猜测。
 
 回合使用 `CODEX_EXEC_SERVER_URL=none`，无执行、文件系统或网络工具，只根据已附加内容返回 schema 绑定的提示词字符串或精确 blocker。父层校验返回结果并独占写入 `prompt.txt`。该设计不产生、复用或传递中间分析 JSON；回合也不执行质量、适用性、身份一致性或生成结果审查。`COMPLETE` 只表示父层收到可校验的非空提示词；父层完成其余确定性 Gate、active video、上传准备、无费用 preflight 和 `submission-plan.json` 后，Job 才进入 `READY_FOR_SUBMISSION`。
 
@@ -162,13 +162,17 @@ Ark adapter 当前只用于内部开发和测试；它没有持久 credential br
 
 `once` 和 `watch` 固定为本地 shadow：可以接入、索引和记录本地状态，不上传、不创建远端任务。它们拒绝任何付费参数。
 
+`check <batch>` 在内存中建立尚未冻结的参考索引视图并校验需求/绑定，不写 `reference-index.json`。`prepare` 首次持久化该索引；已有 flow 或 streaming result 后缺失/变化均阻塞，禁止静默覆盖。
+
 ### 本地准备
 
 ```text
 [LAUNCHER, "prepare", <batch>]
 ```
 
-`prepare` 要求批次位于 `needs-input/` 且 `PAUSE` 存在。它运行分析、提示词、可选自动打码、上传准备、Gate、无费用 probe 和 submission plan；它不上传、不创建远端任务。
+`prepare` 要求批次位于 `needs-input/` 且 `PAUSE` 存在。父流程先按 unique source 建立源证据缓存，并用 `source-evidence-index.json` 冻结每个 manifest、帧哈希、取样规则与 FFmpeg 身份；该索引哈希进入 flow 指纹。JavaScript 随后按 flow 中稳定的 `V###` 顺序以并发 1 严格 FIFO 调用准备 worker，并分别记录 queue wait、auth-lock wait 与 Codex exec 时间。它运行提示词、可选自动打码、上传准备、Gate、无费用 probe 和 submission plan；它不上传、不创建远端任务。只有没有 eligible Job 阻塞时，批次状态才是 `LOCAL_PREPARED_AWAITING_APPROVAL`；部分成功仍是 `LOCAL_PREPARATION_BLOCKED`。每个 Job 的内部 `READY_FOR_SUBMISSION` 不等于已经取得付费授权。
+
+单个本地准备失败时可运行 `[LAUNCHER, "retry-prepare", <batch>, <V###>]`。该命令只接受 `needs-input/`、`PAUSE` 和当前 `BLOCKED/FAILED` 结果，或提交计划已无法通过确定性复验的 READY 结果；它先复制归档旧 attempt，保持 canonical 结果不动，直到新 attempt 原子替换成功。任何 submission result、payment checkpoint 或 task ID 都会阻断它。
 
 ### 当前批次一次付费提交
 
@@ -188,7 +192,7 @@ Python 扫描 stdout 只输出一个 JSON；过程信息进入 stderr。JavaScri
 
 历史 `review/` 批次保留原位并可读取；新任务不写入 `review/`。
 
-原进程中断后，使用 `status --json`、批次状态文件和外置账本判断恢复动作。已记录 task ID 的 Job 恢复同一任务；提交状态不确定时保持阻塞。
+原进程中断后，使用 `status <batch> --json`、批次状态文件和外置账本判断恢复动作。已记录 task ID 的 Job 恢复同一任务；提交状态不确定时保持阻塞。
 
 最终汇报只包含批次路径、Job 绑定、`backend_profile`、`privacy_mode`、本地准备或生成终态、生成文件路径、task ID 和精确 blocker。汇报不评价画面、人物一致性、打码覆盖效果或生成质量。
 

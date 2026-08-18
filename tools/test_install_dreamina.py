@@ -47,6 +47,14 @@ class DreaminaInstallerTests(unittest.TestCase):
         with self.assertRaises(installer.InstallError):
             installer.platform_key("Windows", "arm64")
 
+    def test_platform_key_uses_native_arm64_for_rosetta_python(self) -> None:
+        with mock.patch.object(installer.platform, "system", return_value="Darwin"), mock.patch.object(
+            installer.platform, "machine", return_value="x86_64"
+        ), mock.patch.object(
+            installer.subprocess, "check_output", side_effect=["1\n", "1\n"]
+        ):
+            self.assertEqual(installer.platform_key(), "darwin_arm64")
+
     def test_manifest_uses_https_and_sha256_for_every_artifact(self) -> None:
         manifest = installer.read_manifest()
         artifacts = manifest["artifacts"]

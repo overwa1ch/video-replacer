@@ -98,6 +98,9 @@ DEFAULT_DAILY_PAID_LIMIT = 1
 DEFAULT_NODE_EXEC_TIMEOUT_SECONDS = 1200
 VIDEO_PROMPT_MIN_FRAME_INTERVAL_SECONDS = 0.75
 VIDEO_PROMPT_MAX_FRAMES = 48
+VIDEO_PROMPT_SAMPLER_RECIPE = "ffmpeg-uniform-v1-0.75s-48-scale1280-q3"
+SOURCE_EVIDENCE_CACHE_SCHEMA_VERSION = 1
+SOURCE_EVIDENCE_INDEX_FILENAME = "source-evidence-index.json"
 PAYMENT_AUTH_TOKEN_ENV = "VIDEO_LOOP_PAYMENT_AUTH_TOKEN"
 PAYMENT_CHECKPOINT_TTL_SECONDS = 7200
 PAYMENT_CHECKPOINT_CLOCK_SKEW_SECONDS = 30
@@ -541,6 +544,54 @@ def exclusive_loop_lock(loop_root: Path):
                 import msvcrt
 
                 handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def waiting_file_lock(lock_path: Path, *, timeout_seconds: float = 240.0):
+    """Take one private cross-process file lock, waiting for the current owner."""
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if is_link_like(lock_path.parent):
+        raise LoopError(f"锁目录不得是链接：{lock_path.parent}")
+    if os.name != "nt":
+        lock_path.parent.chmod(0o700)
+    if is_link_like(lock_path):
+        raise LoopError(f"锁文件不得是链接：{lock_path}")
+    with lock_path.open("a+b") as handle:
+        chmod_private(lock_path)
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if time.monotonic() >= deadline:
+                    raise LoopError(f"等待锁超时：{lock_path}") from exc
+                time.sleep(0.1)
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
                 msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
             else:
                 import fcntl
@@ -1114,6 +1165,44 @@ def verify_batch_integrity(
         verify_batch_index(batch, max_batch_videos=max_batch_videos),
         verify_reference_index(batch),
     )
+
+
+def _has_frozen_streaming_artifacts(batch: Path) -> bool:
+    if (batch / "streaming-flow.json").is_file():
+        return True
+    # Source-evidence caches are derived, restartable preparation artifacts.
+    # A partially built cache must not make a new batch look frozen and strand
+    # a still-unwritten reference index. Only canonical Job results freeze it.
+    result_root = batch / "streaming-results"
+    return any(
+        stage_root.is_dir() and any(stage_root.glob("*.json"))
+        for stage_root in (
+            result_root / "preparation",
+            result_root / "submission",
+        )
+    )
+
+
+def reference_index_for_validation(
+    batch: Path,
+    *,
+    persist_if_unfrozen: bool,
+) -> Dict[str, object]:
+    """Validate the frozen index, or build a new-batch view without overwriting."""
+
+    path = batch / "reference-index.json"
+    if path.is_file():
+        return verify_reference_index(batch)
+    if _has_frozen_streaming_artifacts(batch):
+        raise LoopError(
+            "批次已冻结或已有 streaming 结果，但缺少 reference-index.json；"
+            "拒绝静默重建证据"
+        )
+    index = build_reference_index(batch)
+    if not persist_if_unfrozen:
+        return index
+    atomic_write_json(path, index)
+    return verify_reference_index(batch)
 
 
 def expand_video_ids(line: str) -> Set[str]:
@@ -1710,6 +1799,489 @@ def extract_video_prompt_frames(
     }
 
 
+def _source_evidence_cache_spec(
+    source_size: int,
+    source_sha256: str,
+    analysis_tool: Path,
+) -> Dict[str, object]:
+    tool_size, tool_sha256 = _hash_without_change(analysis_tool)
+    return {
+        "source_size_bytes": source_size,
+        "source_sha256": source_sha256,
+        "analysis_tool_size_bytes": tool_size,
+        "analysis_tool_sha256": tool_sha256,
+        "sampler_recipe": VIDEO_PROMPT_SAMPLER_RECIPE,
+    }
+
+
+def _source_evidence_cache_key(spec: Mapping[str, object]) -> str:
+    encoded = json.dumps(
+        dict(spec), sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_source_evidence_cache(
+    cache_dir: Path,
+    expected_spec: Mapping[str, object],
+) -> Dict[str, object]:
+    if is_link_like(cache_dir) or linked_descendants(cache_dir):
+        raise LoopError("源证据缓存不得包含链接或 Windows junction")
+    manifest_path = cache_dir / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise LoopError("源证据缓存 manifest 无效") from exc
+    if not isinstance(manifest, dict) or manifest.get(
+        "schema_version"
+    ) != SOURCE_EVIDENCE_CACHE_SCHEMA_VERSION:
+        raise LoopError("源证据缓存 schema 无效")
+    if manifest.get("cache_spec") != dict(expected_spec):
+        raise LoopError("源证据缓存身份与当前源视频、取样规则或工具不匹配")
+    video_metadata = manifest.get("video_metadata")
+    sampled_frames = manifest.get("sampled_frames")
+    sampling_policy = manifest.get("sampling_policy")
+    if (
+        not isinstance(video_metadata, dict)
+        or not isinstance(sampled_frames, list)
+        or not sampled_frames
+        or len(sampled_frames) > VIDEO_PROMPT_MAX_FRAMES
+        or not isinstance(sampling_policy, dict)
+    ):
+        raise LoopError("源证据缓存字段无效")
+    frame_root = (cache_dir / "inputs" / "frames").resolve()
+    expected_paths: Set[Path] = set()
+    previous_timestamp = -1.0
+    verified_frames: List[Dict[str, object]] = []
+    for raw_frame in sampled_frames:
+        if not isinstance(raw_frame, dict) or set(raw_frame) != {
+            "image",
+            "timestamp_seconds",
+            "size_bytes",
+            "sha256",
+        }:
+            raise LoopError("源证据缓存帧字段无效")
+        relative = Path(str(raw_frame.get("image") or ""))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise LoopError("源证据缓存帧路径无效")
+        candidate = (cache_dir / relative).resolve()
+        try:
+            candidate.relative_to(frame_root)
+        except ValueError as exc:
+            raise LoopError("源证据缓存帧越过缓存目录") from exc
+        if is_link_like(candidate) or not candidate.is_file():
+            raise LoopError("源证据缓存帧不是普通文件")
+        actual_size, actual_sha256 = _hash_without_change(candidate)
+        timestamp = raw_frame.get("timestamp_seconds")
+        if (
+            raw_frame.get("size_bytes") != actual_size
+            or raw_frame.get("sha256") != actual_sha256
+            or not isinstance(timestamp, (int, float))
+            or float(timestamp) < previous_timestamp
+        ):
+            raise LoopError("源证据缓存帧身份或时间顺序无效")
+        previous_timestamp = float(timestamp)
+        expected_paths.add(candidate)
+        verified_frames.append(dict(raw_frame))
+    actual_paths = {
+        item.resolve()
+        for item in frame_root.rglob("*")
+        if item.is_file()
+    } if frame_root.is_dir() else set()
+    if actual_paths != expected_paths:
+        raise LoopError("源证据缓存帧集合与 manifest 不一致")
+    return {
+        "video_metadata": dict(video_metadata),
+        "sampled_frames": verified_frames,
+        "sampling_policy": dict(sampling_policy),
+    }
+
+
+def _cached_source_evidence(
+    batch: Path,
+    source_path: Path,
+    source_size: int,
+    source_sha256: str,
+    analysis_tool: Path,
+    frame_extractor: Callable[[Path, Path, Path], Dict[str, object]],
+) -> Tuple[Path, Dict[str, object]]:
+    spec = _source_evidence_cache_spec(
+        source_size, source_sha256, analysis_tool
+    )
+    cache_key = _source_evidence_cache_key(spec)
+    cache_root = batch / "streaming-results" / "source-evidence"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    if is_link_like(cache_root):
+        raise LoopError("源证据缓存根目录不得是链接或 Windows junction")
+    if os.name != "nt":
+        cache_root.chmod(0o700)
+    cache_dir = cache_root / cache_key
+    lock_path = cache_root / ".locks" / f"{cache_key}.lock"
+    with waiting_file_lock(lock_path):
+        if cache_dir.exists():
+            if is_link_like(cache_dir) or not cache_dir.is_dir():
+                raise LoopError("源证据缓存路径不是安全目录")
+            return cache_dir, _validate_source_evidence_cache(cache_dir, spec)
+        with tempfile.TemporaryDirectory(
+            prefix=f".building-{cache_key[:12]}-", dir=cache_root
+        ) as temporary_value:
+            staging = Path(temporary_value)
+            frame_root = staging / "inputs" / "frames"
+            extracted = frame_extractor(source_path, frame_root, analysis_tool)
+            if not isinstance(extracted, dict):
+                raise LoopError("源证据缓存取样结果无效")
+            manifest = {
+                "schema_version": SOURCE_EVIDENCE_CACHE_SCHEMA_VERSION,
+                "created_at": utc_now(),
+                "cache_spec": spec,
+                "video_metadata": extracted.get("video_metadata"),
+                "sampled_frames": extracted.get("sampled_frames"),
+                "sampling_policy": extracted.get("sampling_policy"),
+            }
+            atomic_write_json(staging / "manifest.json", manifest)
+            _validate_source_evidence_cache(staging, spec)
+            make_tree_private(staging)
+            staging.replace(cache_dir)
+        return cache_dir, _validate_source_evidence_cache(cache_dir, spec)
+
+
+def _source_evidence_index_path(batch: Path) -> Path:
+    return batch / SOURCE_EVIDENCE_INDEX_FILENAME
+
+
+def _source_evidence_source(
+    batch: Path, job: Mapping[str, object]
+) -> Tuple[Path, int, str]:
+    job_id = str(job.get("id") or "")
+    source = _indexed_relative_path(
+        batch, job.get("relative_path"), batch / "videos", job_id
+    )
+    if is_link_like(source) or not source.is_file():
+        raise LoopError(f"{job_id} 源视频不是普通文件")
+    size_bytes, sha256 = _hash_without_change(source)
+    if size_bytes != job.get("size_bytes") or sha256 != job.get("sha256"):
+        raise LoopError(f"{job_id} 源视频身份不匹配")
+    return source, size_bytes, sha256
+
+
+def build_source_evidence_index(
+    batch: Path,
+    index: Mapping[str, object],
+    analysis_tool: Path,
+    *,
+    skipped_ids: Optional[Set[str]] = None,
+    frame_extractor: Callable[
+        [Path, Path, Path], Dict[str, object]
+    ] = extract_video_prompt_frames,
+) -> Dict[str, object]:
+    """Materialize each unique active source once and return its frozen anchors."""
+
+    jobs = index.get("jobs")
+    if not isinstance(jobs, list):
+        raise LoopError("源证据索引缺少 batch jobs")
+    skipped = explicitly_skipped_ids(batch) if skipped_ids is None else skipped_ids
+    trusted_tool = analysis_tool.expanduser().resolve()
+    if is_link_like(trusted_tool) or not trusted_tool.is_file():
+        raise LoopError("源证据分析工具不是普通文件")
+    entries_by_key: Dict[str, Dict[str, object]] = {}
+    job_cache_keys: Dict[str, str] = {}
+    for raw_job in jobs:
+        if not isinstance(raw_job, dict):
+            raise LoopError("源证据索引包含无效 Job")
+        job_id = str(raw_job.get("id") or "")
+        if job_id in skipped:
+            continue
+        source, source_size, source_sha256 = _source_evidence_source(
+            batch, raw_job
+        )
+        spec = _source_evidence_cache_spec(
+            source_size, source_sha256, trusted_tool
+        )
+        cache_key = _source_evidence_cache_key(spec)
+        cache_dir, extracted = _cached_source_evidence(
+            batch,
+            source,
+            source_size,
+            source_sha256,
+            trusted_tool,
+            frame_extractor,
+        )
+        manifest_path = cache_dir / "manifest.json"
+        manifest_size, manifest_sha256 = _hash_without_change(manifest_path)
+        sampled_frames = extracted.get("sampled_frames")
+        if not isinstance(sampled_frames, list) or not sampled_frames:
+            raise LoopError(f"{job_id} 源证据缓存没有有效帧")
+        entry = {
+            "cache_key": cache_key,
+            "cache_relative_path": cache_dir.relative_to(batch).as_posix(),
+            "cache_spec": spec,
+            "manifest_size_bytes": manifest_size,
+            "manifest_sha256": manifest_sha256,
+            "sampled_frame_count": len(sampled_frames),
+        }
+        prior = entries_by_key.setdefault(cache_key, entry)
+        if prior != entry:
+            raise LoopError("同一源证据 cache key 对应了不同 manifest")
+        job_cache_keys[job_id] = cache_key
+    return {
+        "schema_version": 1,
+        "batch_id": batch.name,
+        "created_at": utc_now(),
+        "sampler_recipe": VIDEO_PROMPT_SAMPLER_RECIPE,
+        "cache_schema_version": SOURCE_EVIDENCE_CACHE_SCHEMA_VERSION,
+        "entries": [entries_by_key[key] for key in sorted(entries_by_key)],
+        "job_cache_keys": job_cache_keys,
+    }
+
+
+def verify_source_evidence_index(
+    batch: Path,
+    index: Mapping[str, object],
+    analysis_tool: Optional[Path] = None,
+    *,
+    skipped_ids: Optional[Set[str]] = None,
+) -> Dict[str, object]:
+    """Verify the immutable batch index and every manifest/frame it anchors."""
+
+    path = _source_evidence_index_path(batch)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise LoopError(f"{SOURCE_EVIDENCE_INDEX_FILENAME} 无效或缺失") from exc
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema_version",
+        "batch_id",
+        "created_at",
+        "sampler_recipe",
+        "cache_schema_version",
+        "entries",
+        "job_cache_keys",
+    }:
+        raise LoopError(f"{SOURCE_EVIDENCE_INDEX_FILENAME} 字段无效")
+    if not (
+        payload.get("schema_version") == 1
+        and payload.get("batch_id") == batch.name
+        and isinstance(payload.get("created_at"), str)
+        and payload.get("sampler_recipe") == VIDEO_PROMPT_SAMPLER_RECIPE
+        and payload.get("cache_schema_version")
+        == SOURCE_EVIDENCE_CACHE_SCHEMA_VERSION
+    ):
+        raise LoopError(f"{SOURCE_EVIDENCE_INDEX_FILENAME} 身份无效")
+    entries = payload.get("entries")
+    job_cache_keys = payload.get("job_cache_keys")
+    jobs = index.get("jobs")
+    if (
+        not isinstance(entries, list)
+        or not isinstance(job_cache_keys, dict)
+        or not isinstance(jobs, list)
+    ):
+        raise LoopError(f"{SOURCE_EVIDENCE_INDEX_FILENAME} 内容无效")
+    trusted_tool = (
+        _trusted_ffmpeg_executable()
+        if analysis_tool is None
+        else analysis_tool.expanduser().resolve()
+    )
+    skipped = explicitly_skipped_ids(batch) if skipped_ids is None else skipped_ids
+    expected_job_keys: Dict[str, str] = {}
+    expected_specs: Dict[str, Dict[str, object]] = {}
+    for raw_job in jobs:
+        if not isinstance(raw_job, dict):
+            raise LoopError("源证据索引包含无效 Job")
+        job_id = str(raw_job.get("id") or "")
+        if job_id in skipped:
+            continue
+        _source, source_size, source_sha256 = _source_evidence_source(
+            batch, raw_job
+        )
+        spec = _source_evidence_cache_spec(
+            source_size, source_sha256, trusted_tool
+        )
+        cache_key = _source_evidence_cache_key(spec)
+        expected_job_keys[job_id] = cache_key
+        expected_specs[cache_key] = spec
+    if job_cache_keys != expected_job_keys:
+        raise LoopError("源证据 Job 映射与当前批次、跳过规则或工具不匹配")
+    entries_by_key: Dict[str, Dict[str, object]] = {}
+    for raw_entry in entries:
+        if not isinstance(raw_entry, dict) or set(raw_entry) != {
+            "cache_key",
+            "cache_relative_path",
+            "cache_spec",
+            "manifest_size_bytes",
+            "manifest_sha256",
+            "sampled_frame_count",
+        }:
+            raise LoopError("源证据锚点字段无效")
+        cache_key = str(raw_entry.get("cache_key") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", cache_key):
+            raise LoopError("源证据 cache key 无效")
+        if cache_key in entries_by_key:
+            raise LoopError("源证据 cache key 重复")
+        expected_spec = expected_specs.get(cache_key)
+        if expected_spec is None or raw_entry.get("cache_spec") != expected_spec:
+            raise LoopError("源证据锚点与当前源视频、规则或工具不匹配")
+        expected_cache_dir = (
+            batch / "streaming-results" / "source-evidence" / cache_key
+        ).resolve()
+        raw_relative = Path(str(raw_entry.get("cache_relative_path") or ""))
+        if raw_relative.is_absolute() or ".." in raw_relative.parts:
+            raise LoopError("源证据缓存路径无效")
+        cache_dir = (batch / raw_relative).resolve()
+        if cache_dir != expected_cache_dir:
+            raise LoopError("源证据缓存路径与 cache key 不匹配")
+        manifest_size, manifest_sha256 = _hash_without_change(
+            cache_dir / "manifest.json"
+        )
+        if (
+            manifest_size != raw_entry.get("manifest_size_bytes")
+            or manifest_sha256 != raw_entry.get("manifest_sha256")
+        ):
+            raise LoopError("源证据 manifest 已在 flow 冻结后发生变化")
+        extracted = _validate_source_evidence_cache(cache_dir, expected_spec)
+        frames = extracted.get("sampled_frames")
+        if (
+            not isinstance(frames, list)
+            or len(frames) != raw_entry.get("sampled_frame_count")
+        ):
+            raise LoopError("源证据帧数量与冻结锚点不匹配")
+        entries_by_key[cache_key] = dict(raw_entry)
+    if set(entries_by_key) != set(expected_specs):
+        raise LoopError("源证据缓存集合与当前活动 Job 不一致")
+    return payload
+
+
+def ensure_source_evidence_index(
+    batch: Path,
+    index: Mapping[str, object],
+    analysis_tool: Optional[Path] = None,
+    *,
+    skipped_ids: Optional[Set[str]] = None,
+    frame_extractor: Callable[
+        [Path, Path, Path], Dict[str, object]
+    ] = extract_video_prompt_frames,
+) -> Dict[str, object]:
+    """Create the source evidence freeze once; never rewrite an existing index."""
+
+    trusted_tool = (
+        _trusted_ffmpeg_executable()
+        if analysis_tool is None
+        else analysis_tool.expanduser().resolve()
+    )
+    path = _source_evidence_index_path(batch)
+    if path.is_file():
+        return verify_source_evidence_index(
+            batch,
+            index,
+            trusted_tool,
+            skipped_ids=skipped_ids,
+        )
+    built = build_source_evidence_index(
+        batch,
+        index,
+        trusted_tool,
+        skipped_ids=skipped_ids,
+        frame_extractor=frame_extractor,
+    )
+    atomic_write_json(path, built)
+    return verify_source_evidence_index(
+        batch,
+        index,
+        trusted_tool,
+        skipped_ids=skipped_ids,
+    )
+
+
+def _anchored_source_evidence_cache(
+    batch: Path,
+    source_size: int,
+    source_sha256: str,
+    analysis_tool: Path,
+) -> Tuple[Path, Dict[str, object]]:
+    """Resolve one cache only when its index is bound to the frozen flow."""
+
+    index_path = _source_evidence_index_path(batch)
+    flow_path = batch / "streaming-flow.json"
+    try:
+        flow = json.loads(flow_path.read_text(encoding="utf-8"))
+        payload = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise LoopError("源证据尚未被 streaming flow 冻结") from exc
+    if not isinstance(flow, dict) or not isinstance(payload, dict):
+        raise LoopError("源证据 flow 或索引无效")
+    _index_size, index_sha256 = _hash_without_change(index_path)
+    if flow.get("source_evidence_index_sha256") != index_sha256:
+        raise LoopError("源证据索引与 frozen flow 不匹配")
+    spec = _source_evidence_cache_spec(
+        source_size, source_sha256, analysis_tool
+    )
+    cache_key = _source_evidence_cache_key(spec)
+    entries = payload.get("entries")
+    entry = next(
+        (
+            item
+            for item in entries
+            if isinstance(item, dict) and item.get("cache_key") == cache_key
+        ),
+        None,
+    ) if isinstance(entries, list) else None
+    if not isinstance(entry, dict) or entry.get("cache_spec") != spec:
+        raise LoopError("当前 Job 没有 frozen source evidence 锚点")
+    cache_dir = batch / "streaming-results" / "source-evidence" / cache_key
+    manifest_size, manifest_sha256 = _hash_without_change(
+        cache_dir / "manifest.json"
+    )
+    if (
+        manifest_size != entry.get("manifest_size_bytes")
+        or manifest_sha256 != entry.get("manifest_sha256")
+    ):
+        raise LoopError("源证据 manifest 已在 flow 冻结后发生变化")
+    return cache_dir, _validate_source_evidence_cache(cache_dir, spec)
+
+
+def _stage_cached_source_evidence(
+    batch: Path,
+    workspace: Path,
+    source_path: Path,
+    source_size: int,
+    source_sha256: str,
+    analysis_tool: Path,
+    frame_extractor: Callable[[Path, Path, Path], Dict[str, object]],
+) -> Dict[str, object]:
+    del source_path, frame_extractor
+    cache_dir, extracted = _anchored_source_evidence_cache(
+        batch, source_size, source_sha256, analysis_tool
+    )
+    frame_root = workspace / "inputs" / "frames"
+    frame_root.mkdir(parents=True, exist_ok=False)
+    staged_frames: List[Dict[str, object]] = []
+    sampled_frames = extracted["sampled_frames"]
+    assert isinstance(sampled_frames, list)
+    for raw_frame in sampled_frames:
+        assert isinstance(raw_frame, dict)
+        relative = Path(str(raw_frame["image"]))
+        source = (cache_dir / relative).resolve()
+        destination = (workspace / relative).resolve()
+        try:
+            destination.relative_to(frame_root.resolve())
+        except ValueError as exc:
+            raise LoopError("源证据 staging 路径越过工作区") from exc
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        actual_size, actual_sha256 = _hash_without_change(destination)
+        if (
+            actual_size != raw_frame.get("size_bytes")
+            or actual_sha256 != raw_frame.get("sha256")
+        ):
+            destination.unlink(missing_ok=True)
+            raise LoopError("源证据 staging 身份不匹配")
+        staged_frames.append(dict(raw_frame))
+    return {
+        "video_metadata": dict(extracted["video_metadata"]),
+        "sampled_frames": staged_frames,
+        "sampling_policy": dict(extracted["sampling_policy"]),
+    }
+
+
 def write_video_to_prompt_node_input(
     batch: Path,
     project_root: Path,
@@ -1734,7 +2306,15 @@ def write_video_to_prompt_node_input(
         raise LoopError(f"{job_id} 源视频身份不匹配")
 
     trusted_analysis_tool = analysis_tool.expanduser().resolve()
-    extracted = frame_extractor(source_path, frame_root, trusted_analysis_tool)
+    extracted = _stage_cached_source_evidence(
+        batch,
+        workspace,
+        source_path,
+        source_size,
+        source_sha256,
+        trusted_analysis_tool,
+        frame_extractor,
+    )
     if not isinstance(extracted, dict):
         raise LoopError(f"{job_id} 视频取样结果无效")
     video_metadata = extracted.get("video_metadata")
@@ -2405,6 +2985,7 @@ def _run_codex_exec(
         raise LoopError("节点执行必须绑定至少一个 Job")
     timeout_seconds = _node_exec_timeout_seconds()
     started_at = utc_now()
+    total_started_monotonic = time.monotonic()
     invocation_id = (
         datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         + f"-{os.getpid()}-{uuid.uuid4().hex}"
@@ -2426,76 +3007,142 @@ def _run_codex_exec(
     log_stem = f"{batch.name}-{scope_name}-{invocation_id}"
     stdout_path = loop_root / "logs" / f"{log_stem}.jsonl"
     stderr_path = loop_root / "logs" / f"{log_stem}.stderr.log"
+    atomic_write_json(
+        process_path,
+        {
+            "phase": "STAGING",
+            "stage": stage,
+            "job_ids": scoped_ids,
+            "timeout_seconds": timeout_seconds,
+            "started_at": started_at,
+        },
+    )
+
+    def record_setup_failure(exc: BaseException) -> None:
+        atomic_write_json(
+            process_path,
+            {
+                "phase": "SETUP_FAILED",
+                "stage": stage,
+                "job_ids": scoped_ids,
+                "timeout_seconds": timeout_seconds,
+                "started_at": started_at,
+                "finished_at": utc_now(),
+                "total_seconds": round(
+                    time.monotonic() - total_started_monotonic, 6
+                ),
+                "error": str(exc),
+            },
+        )
+
     state_dir = executor_state_dir(loop_root)
-    require_external_state_dir(state_dir, loop_root, project_root)
     try:
+        require_external_state_dir(state_dir, loop_root, project_root)
         codex_node_home = validate_node_home(
             state_dir / NODE_HOME_DIRECTORY,
             repo_root=project_root,
             require_auth=True,
         )
-    except CodexNodeHomeError as exc:
+    except (CodexNodeHomeError, LoopError) as exc:
+        record_setup_failure(exc)
         raise LoopError(str(exc)) from exc
     node_runs_root = state_dir / "node-runs"
-    node_runs_root.mkdir(parents=True, exist_ok=True)
-    if os.name != "nt":
-        node_runs_root.chmod(0o700)
-    with tempfile.TemporaryDirectory(
-        prefix=f"video-loop-{scope_name}-",
-        dir=node_runs_root,
-    ) as temporary_value:
-        temporary_root = Path(temporary_value).resolve()
+    try:
+        node_runs_root.mkdir(parents=True, exist_ok=True)
         if os.name != "nt":
-            temporary_root.chmod(0o700)
+            node_runs_root.chmod(0o700)
+        temporary_directory = tempfile.TemporaryDirectory(
+            prefix=f"video-loop-{scope_name}-",
+            dir=node_runs_root,
+        )
+    except Exception as exc:
+        record_setup_failure(exc)
+        raise
+    with temporary_directory as temporary_value:
+        temporary_root = Path(temporary_value).resolve()
         workspace_root = temporary_root / "workspace"
         transport_root = temporary_root / "transport"
-        workspace_root.mkdir(mode=0o700)
-        transport_root.mkdir(mode=0o700)
         shell_home = workspace_root / "home"
         shell_tmp = workspace_root / "tmp"
-        shell_home.mkdir(mode=0o700)
-        shell_tmp.mkdir(mode=0o700)
-        if node_workspace_setup is not None:
-            node_workspace_setup(workspace_root)
-        runtime_prompt = prompt(workspace_root) if callable(prompt) else prompt
-        if not isinstance(runtime_prompt, str) or not runtime_prompt.strip():
-            raise LoopError("节点 prompt 为空")
-        atomic_write_text(prompt_path, runtime_prompt)
-        attached_image_paths: List[Path] = []
-        for raw_path in attached_workspace_images:
-            if raw_path.is_absolute() or ".." in raw_path.parts:
-                raise LoopError(f"节点附加图片路径必须位于工作区内：{raw_path}")
-            candidate_image = workspace_root / raw_path
-            if is_link_like(candidate_image):
-                raise LoopError(f"节点附加图片不得是链接或 Windows junction：{raw_path}")
-            image_path = candidate_image.resolve()
-            try:
-                image_path.relative_to(workspace_root)
-            except ValueError as exc:
-                raise LoopError(f"节点附加图片越过工作区：{raw_path}") from exc
-            if is_link_like(image_path) or not image_path.is_file():
-                raise LoopError(f"节点附加图片不存在或不是普通文件：{raw_path}")
-            attached_image_paths.append(image_path)
-        runtime_schema_path = transport_root / "output.schema.json"
-        shutil.copy2(schema_path, runtime_schema_path)
-        runtime_result_path = transport_root / "codex-result.json"
-        codex_binary = find_codex()
-        if os.name == "nt":
-            try:
+        try:
+            if os.name != "nt":
+                temporary_root.chmod(0o700)
+            workspace_root.mkdir(mode=0o700)
+            transport_root.mkdir(mode=0o700)
+            shell_home.mkdir(mode=0o700)
+            shell_tmp.mkdir(mode=0o700)
+            if node_workspace_setup is not None:
+                node_workspace_setup(workspace_root)
+            runtime_prompt = prompt(workspace_root) if callable(prompt) else prompt
+            if not isinstance(runtime_prompt, str) or not runtime_prompt.strip():
+                raise LoopError("节点 prompt 为空")
+            atomic_write_text(prompt_path, runtime_prompt)
+            attached_image_paths: List[Path] = []
+            for raw_path in attached_workspace_images:
+                if raw_path.is_absolute() or ".." in raw_path.parts:
+                    raise LoopError(
+                        f"节点附加图片路径必须位于工作区内：{raw_path}"
+                    )
+                candidate_image = workspace_root / raw_path
+                if is_link_like(candidate_image):
+                    raise LoopError(
+                        f"节点附加图片不得是链接或 Windows junction：{raw_path}"
+                    )
+                image_path = candidate_image.resolve()
+                try:
+                    image_path.relative_to(workspace_root)
+                except ValueError as exc:
+                    raise LoopError(f"节点附加图片越过工作区：{raw_path}") from exc
+                if is_link_like(image_path) or not image_path.is_file():
+                    raise LoopError(
+                        f"节点附加图片不存在或不是普通文件：{raw_path}"
+                    )
+                attached_image_paths.append(image_path)
+            runtime_schema_path = transport_root / "output.schema.json"
+            shutil.copy2(schema_path, runtime_schema_path)
+            runtime_result_path = transport_root / "codex-result.json"
+            codex_binary = find_codex()
+            if os.name == "nt":
                 verified_codex = verify_windows_codex(Path(codex_binary))
                 codex_binary = str(verified_codex["binary"])
-            except CodexArtifactError as exc:
+            command = build_codex_command(
+                codex_binary,
+                batch,
+                project_root,
+                runtime_schema_path,
+                runtime_result_path,
+                node_workspace=workspace_root,
+                image_paths=attached_image_paths,
+            )
+        except Exception as exc:
+            record_setup_failure(exc)
+            if isinstance(exc, CodexArtifactError):
                 raise LoopError(
                     f"official Windows Codex provenance failed before execution: {exc}"
                 ) from exc
-        command = build_codex_command(
-            codex_binary,
-            batch,
-            project_root,
-            runtime_schema_path,
-            runtime_result_path,
-            node_workspace=workspace_root,
-            image_paths=attached_image_paths,
+            raise
+        queued_at = utc_now()
+        lock_wait_started_monotonic = time.monotonic()
+        lock_acquired_at: Optional[str] = None
+        exec_started_at: Optional[str] = None
+        exec_finished_at: Optional[str] = None
+        lock_acquired_monotonic: Optional[float] = None
+        exec_started_monotonic: Optional[float] = None
+        exec_finished_monotonic: Optional[float] = None
+        completed: Optional[subprocess.CompletedProcess[str]] = None
+        timed_out = False
+        lock_error: Optional[CodexNodeHomeError] = None
+        exec_error: Optional[OSError] = None
+        atomic_write_json(
+            process_path,
+            {
+                "phase": "WAITING_FOR_AUTH_LOCK",
+                "stage": stage,
+                "job_ids": scoped_ids,
+                "timeout_seconds": timeout_seconds,
+                "started_at": started_at,
+                "queued_at": queued_at,
+            },
         )
         with stdout_path.open("w", encoding="utf-8") as stdout_handle, stderr_path.open(
             "w", encoding="utf-8"
@@ -2507,38 +3154,98 @@ def _run_codex_exec(
                     codex_node_home,
                     timeout_seconds=max(120.0, float(timeout_seconds) * 4),
                 ):
-                    completed = subprocess.run(
-                        command,
-                        cwd=str(workspace_root),
-                        stdout=stdout_handle,
-                        stderr=stderr_handle,
-                        input=runtime_prompt,
-                        text=True,
-                        check=False,
-                        timeout=timeout_seconds,
-                        env=codex_subprocess_environment(
-                            codex_home=codex_node_home,
-                            shell_home=shell_home,
-                            shell_tmp=shell_tmp,
-                        ),
+                    lock_acquired_at = utc_now()
+                    lock_acquired_monotonic = time.monotonic()
+                    exec_started_at = utc_now()
+                    exec_started_monotonic = time.monotonic()
+                    atomic_write_json(
+                        process_path,
+                        {
+                            "phase": "EXECUTING",
+                            "stage": stage,
+                            "job_ids": scoped_ids,
+                            "timeout_seconds": timeout_seconds,
+                            "started_at": started_at,
+                            "queued_at": queued_at,
+                            "lock_acquired_at": lock_acquired_at,
+                            "exec_started_at": exec_started_at,
+                            "auth_lock_wait_seconds": round(
+                                lock_acquired_monotonic
+                                - lock_wait_started_monotonic,
+                                6,
+                            ),
+                        },
                     )
+                    try:
+                        completed = subprocess.run(
+                            command,
+                            cwd=str(workspace_root),
+                            stdout=stdout_handle,
+                            stderr=stderr_handle,
+                            input=runtime_prompt,
+                            text=True,
+                            check=False,
+                            timeout=timeout_seconds,
+                            env=codex_subprocess_environment(
+                                codex_home=codex_node_home,
+                                shell_home=shell_home,
+                                shell_tmp=shell_tmp,
+                            ),
+                        )
+                    finally:
+                        exec_finished_at = utc_now()
+                        exec_finished_monotonic = time.monotonic()
             except subprocess.TimeoutExpired:
-                completed = None
+                timed_out = True
             except CodexNodeHomeError as exc:
-                raise LoopError(str(exc)) from exc
+                lock_error = exc
+            except OSError as exc:
+                exec_error = exc
         result_text = (
             runtime_result_path.read_text(encoding="utf-8")
             if runtime_result_path.is_file()
             else None
         )
-    atomic_write_json(
-        process_path,
-        {
-            "returncode": (
-                completed.returncode if completed is not None else None
-            ),
-            "timed_out": completed is None,
+    finished_at = utc_now()
+    total_finished_monotonic = time.monotonic()
+    auth_lock_wait_seconds = (
+        (lock_acquired_monotonic or total_finished_monotonic)
+        - lock_wait_started_monotonic
+    )
+    exec_seconds = (
+        (exec_finished_monotonic - exec_started_monotonic)
+        if exec_finished_monotonic is not None
+        and exec_started_monotonic is not None
+        else 0.0
+    )
+    if lock_error is not None:
+        phase = "LOCK_FAILED"
+    elif timed_out:
+        phase = "TIMED_OUT"
+    elif exec_error is not None:
+        phase = "EXEC_FAILED"
+    elif completed is not None and completed.returncode == 0:
+        phase = "RESULT_PENDING_VALIDATION"
+    else:
+        phase = "FAILED"
+    reconnect_text = ""
+    for log_path in (stdout_path, stderr_path):
+        try:
+            reconnect_text += log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+    reconnect_count = len(
+        re.findall(
+            r"\b(?:reconnecting|connection failed|tls handshake failed)\b",
+            reconnect_text,
+            flags=re.IGNORECASE,
+        )
+    )
+    process_record = {
+            "returncode": completed.returncode if completed is not None else None,
+            "timed_out": timed_out,
             "timeout_seconds": timeout_seconds,
+            "phase": phase,
             "stage": stage,
             "job_ids": scoped_ids,
             "stdout_log": str(stdout_path),
@@ -2557,26 +3264,58 @@ def _run_codex_exec(
             "plugins_disabled": True,
             "apps_disabled": True,
             "multi_agent_disabled": True,
+            "queued_at": queued_at,
+            "lock_acquired_at": lock_acquired_at,
+            "exec_started_at": exec_started_at,
+            "exec_finished_at": exec_finished_at,
+            "auth_lock_wait_seconds": round(auth_lock_wait_seconds, 6),
+            "exec_seconds": round(exec_seconds, 6),
+            "total_seconds": round(
+                total_finished_monotonic - total_started_monotonic, 6
+            ),
+            "transport_reconnect_count": reconnect_count,
             "started_at": started_at,
-            "finished_at": utc_now(),
-        },
-    )
-    if completed is None:
+            "finished_at": finished_at,
+        }
+    if lock_error is not None:
+        process_record["error"] = str(lock_error)
+    elif exec_error is not None:
+        process_record["error"] = str(exec_error)
+    atomic_write_json(process_path, process_record)
+    if lock_error is not None:
+        raise LoopError(str(lock_error)) from lock_error
+    if timed_out:
         raise LoopError(
             f"{','.join(scoped_ids)} {stage} 的 codex exec 超过 "
             f"{timeout_seconds} 秒；查看 {stdout_path} 和 {stderr_path}"
         )
+    if exec_error is not None:
+        raise LoopError(f"codex exec 启动失败：{exec_error}") from exec_error
+    assert completed is not None
     if completed.returncode != 0:
         raise LoopError(f"codex exec 退出码 {completed.returncode}；查看 {stderr_path}")
     if result_text is None:
+        process_record["phase"] = "RESULT_MISSING"
+        process_record["error"] = "codex exec 成功退出，但没有生成节点结果"
+        atomic_write_json(process_path, process_record)
         raise LoopError("codex exec 成功退出，但没有生成节点结果")
     try:
         result = json.loads(result_text)
     except json.JSONDecodeError as exc:
+        process_record["phase"] = "RESULT_INVALID"
+        process_record["error"] = f"节点结果不是有效 JSON：{exc}"
+        atomic_write_json(process_path, process_record)
         raise LoopError(f"节点结果不是有效 JSON：{exc}") from exc
     if not isinstance(result, dict):
+        process_record["phase"] = "RESULT_INVALID"
+        process_record["error"] = "codex-result.json 不是 JSON 对象"
+        atomic_write_json(process_path, process_record)
         raise LoopError("codex-result.json 不是 JSON 对象")
     atomic_write_json(result_path, result)
+    process_record["phase"] = "SUCCEEDED"
+    process_record["result_validated_at"] = utc_now()
+    process_record.pop("error", None)
+    atomic_write_json(process_path, process_record)
     return result
 
 
@@ -5017,6 +5756,59 @@ def _streaming_job_result_path(batch: Path, stage: str, job_id: str) -> Path:
     return root / f"{job_id}.json"
 
 
+def _expected_streaming_flow_jobs(
+    batch: Path,
+    index: Mapping[str, object],
+) -> List[Dict[str, object]]:
+    """Derive the one canonical ordered Job manifest for a frozen flow."""
+
+    indexed_jobs = index.get("jobs")
+    if not isinstance(indexed_jobs, list):
+        raise LoopError("batch-index.json 缺少 jobs")
+    skipped = explicitly_skipped_ids(batch)
+    expected: List[Dict[str, object]] = []
+    for raw_job in indexed_jobs:
+        if not isinstance(raw_job, dict):
+            raise LoopError("batch-index.json 的 Job 记录无效")
+        expected.append(
+            {
+                "id": str(raw_job.get("id") or ""),
+                "filename": str(raw_job.get("filename") or ""),
+                "skipped": str(raw_job.get("id") or "") in skipped,
+            }
+        )
+    return expected
+
+
+def _streaming_flow_jobs_sha256(
+    jobs: Sequence[Mapping[str, object]],
+) -> str:
+    canonical = json.dumps(
+        list(jobs), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _validate_frozen_flow_jobs(
+    batch: Path,
+    flow: Mapping[str, object],
+    index: Mapping[str, object],
+) -> List[Dict[str, object]]:
+    """Reject reordered, duplicated, omitted, or rewritten frozen Jobs."""
+
+    expected = _expected_streaming_flow_jobs(batch, index)
+    actual = flow.get("jobs")
+    if actual != expected:
+        raise LoopError(
+            "streaming-flow.json 的冻结 Job 清单与 batch-index/requirements 不一致"
+        )
+    expected_sha256 = _streaming_flow_jobs_sha256(expected)
+    declared_sha256 = flow.get("flow_jobs_sha256")
+    if declared_sha256 is not None and declared_sha256 != expected_sha256:
+        raise LoopError("streaming-flow.json 的冻结 Job 清单哈希无效")
+    return expected
+
+
 def _streaming_flow_identity(
     batch: Path,
     project_root: Path,
@@ -5041,6 +5833,7 @@ def _streaming_flow_identity(
         for job in jobs
         if isinstance(job, dict) and str(job.get("id")) in bindings
     }
+    flow_jobs = _expected_streaming_flow_jobs(batch, index)
     identity = {
         "schema_version": 1,
         "batch_id": batch.name,
@@ -5049,6 +5842,7 @@ def _streaming_flow_identity(
         "reference_index_sha256": sha256_file(batch / "reference-index.json"),
         "job_bindings_sha256": sha256_file(binding_path),
         "job_ids": [str(job.get("id")) for job in jobs if isinstance(job, dict)],
+        "flow_jobs_sha256": _streaming_flow_jobs_sha256(flow_jobs),
         "reference_ids": [
             str(item.get("id")) for item in references if isinstance(item, dict)
         ],
@@ -5063,6 +5857,24 @@ def _streaming_flow_identity(
         identity["video_to_prompt_contract_sha256"] = sha256_file(
             node_contract_path("video-to-prompt.md")
         )
+        source_evidence_path = _source_evidence_index_path(batch)
+        if source_evidence_path.is_file():
+            trusted_tool = _trusted_ffmpeg_executable()
+            source_evidence = verify_source_evidence_index(
+                batch, index, trusted_tool
+            )
+            tool_size, tool_sha256 = _hash_without_change(trusted_tool)
+            identity["source_evidence_index_sha256"] = sha256_file(
+                source_evidence_path
+            )
+            identity["source_evidence_sampler_recipe"] = source_evidence.get(
+                "sampler_recipe"
+            )
+            identity["source_evidence_cache_schema_version"] = (
+                source_evidence.get("cache_schema_version")
+            )
+            identity["source_evidence_analysis_tool_size_bytes"] = tool_size
+            identity["source_evidence_analysis_tool_sha256"] = tool_sha256
     if profile_managed:
         identity["backend_profile"] = profile.profile_id
         identity["backend_profile_constraints_sha256"] = profile.constraints_digest
@@ -5097,6 +5909,13 @@ def _matches_retired_prompt_pipeline_flow(
         retired_identity["prompt_pipeline"] = retired_version
         retired_identity["video_to_prompt_model"] = retired_model
         retired_identity["video_to_prompt_contract_sha256"] = retired_contract
+    elif retired_version == PROMPT_PIPELINE_VERSION and (
+        "source_evidence_index_sha256" not in flow
+        or "flow_jobs_sha256" not in flow
+    ):
+        # Fully prepared flows from before either immutable-manifest freeze
+        # keep their original prompt contract, but may never create new prompts.
+        pass
     elif "prompt_pipeline" not in flow:
         # Pre-versioned schema-v3 flows can only be resumed after every Job is
         # already prepared and its paid-capable submission plan is rechecked.
@@ -5105,8 +5924,33 @@ def _matches_retired_prompt_pipeline_flow(
         retired_identity.pop("video_to_prompt_contract_sha256", None)
     else:
         return False
+    if "source_evidence_index_sha256" not in flow:
+        for key in (
+            "source_evidence_index_sha256",
+            "source_evidence_sampler_recipe",
+            "source_evidence_cache_schema_version",
+            "source_evidence_analysis_tool_size_bytes",
+            "source_evidence_analysis_tool_sha256",
+        ):
+            retired_identity.pop(key, None)
+    if "flow_jobs_sha256" not in flow:
+        retired_identity.pop("flow_jobs_sha256", None)
     return flow.get("flow_fingerprint") == _streaming_flow_fingerprint(
         retired_identity
+    )
+
+
+def _matches_pre_job_manifest_flow(
+    flow: Mapping[str, object], current_identity: Mapping[str, object]
+) -> bool:
+    """Match a fully prepared legacy flow frozen before Job-manifest hashing."""
+
+    if "flow_jobs_sha256" in flow:
+        return False
+    legacy_identity = dict(current_identity)
+    legacy_identity.pop("flow_jobs_sha256", None)
+    return flow.get("flow_fingerprint") == _streaming_flow_fingerprint(
+        legacy_identity
     )
 
 
@@ -5191,6 +6035,12 @@ def _is_current_prompt_pipeline_flow(
         and flow.get("video_to_prompt_model") == VIDEO_TO_PROMPT_MODEL
         and flow.get("video_to_prompt_contract_sha256")
         == current_identity.get("video_to_prompt_contract_sha256")
+        and isinstance(flow.get("source_evidence_index_sha256"), str)
+        and flow.get("source_evidence_index_sha256")
+        == current_identity.get("source_evidence_index_sha256")
+        and isinstance(flow.get("flow_jobs_sha256"), str)
+        and flow.get("flow_jobs_sha256")
+        == current_identity.get("flow_jobs_sha256")
     )
 
 
@@ -5241,10 +6091,10 @@ def inspect_streaming_flow(
     atomic_write_json(batch / "requirements-coverage.json", coverage)
     if errors:
         raise LoopError("；".join(errors))
-    atomic_write_json(batch / "reference-index.json", build_reference_index(batch))
-    index, reference_index = verify_batch_integrity(
-        batch, max_batch_videos=max_batch_videos
+    reference_index = reference_index_for_validation(
+        batch, persist_if_unfrozen=False
     )
+    index = verify_batch_index(batch, max_batch_videos=max_batch_videos)
     binding_payload = _job_bindings_payload(batch)
     # Frozen schema-v1/v2 flows remain recoverable without changing their
     # identity.  A new batch, however, must begin as schema v3 so it cannot
@@ -5257,27 +6107,52 @@ def inspect_streaming_flow(
             f"新批次的 {JOB_BINDINGS_FILENAME} 必须使用 schema_version 3"
         )
     require_free_space(project_root, minimum_free_bytes)
+    bindings = validate_job_bindings(batch, index, reference_index)
+    validate_requirement_binding_contract(batch, bindings)
+    # Resolve the selected backend before freezing either derived index so a
+    # correctable profile/binding error cannot strand a half-initialized batch.
+    backend_profile_for_batch(
+        batch, index=index, reference_index=reference_index
+    )
+    flow_path = _streaming_flow_path(batch)
+    existing: Optional[Dict[str, object]] = None
+    if flow_path.is_file():
+        try:
+            raw_existing = json.loads(flow_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise LoopError("既有 streaming-flow.json 无效") from exc
+        if not isinstance(raw_existing, dict):
+            raise LoopError("既有 streaming-flow.json 无效")
+        existing = raw_existing
+    skipped = explicitly_skipped_ids(batch)
+    if binding_payload.get("schema_version") == 3:
+        if existing is None:
+            ensure_source_evidence_index(batch, index, skipped_ids=skipped)
+        elif "source_evidence_index_sha256" in existing:
+            # A frozen flow must retain its exact evidence index; deletion is
+            # corruption, never a request to rebuild evidence in place.
+            verify_source_evidence_index(batch, index, skipped_ids=skipped)
+    reference_path = batch / "reference-index.json"
+    if not reference_path.is_file():
+        atomic_write_json(reference_path, reference_index)
+        reference_index = verify_reference_index(batch)
     identity = _streaming_flow_identity(
         batch, project_root, index, reference_index
     )
     fingerprint = _streaming_flow_fingerprint(identity)
-    flow_path = _streaming_flow_path(batch)
-    if flow_path.is_file():
-        try:
-            existing = json.loads(flow_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise LoopError("既有 streaming-flow.json 无效") from exc
+    if existing is not None:
+        _validate_frozen_flow_jobs(batch, existing, index)
         existing_fingerprint = (
             str(existing.get("flow_fingerprint", ""))
-            if isinstance(existing, dict)
-            else ""
+            if isinstance(existing, dict) else ""
         )
-        if not isinstance(existing, dict):
-            raise LoopError("既有 streaming-flow.json 无效")
         binding_schema = binding_payload.get("schema_version")
         if binding_schema in {1, 2}:
             if (
-                existing_fingerprint == fingerprint
+                (
+                    existing_fingerprint == fingerprint
+                    or _matches_pre_job_manifest_flow(existing, identity)
+                )
                 and _retired_prompt_pipeline_flow_is_fully_prepared(
                     batch, existing, identity
                 )
@@ -5289,12 +6164,6 @@ def inspect_streaming_flow(
                     project_root,
                     existing,
                     max_batch_videos=max_batch_videos,
-                )
-                _write_streaming_inspection_state(
-                    batch,
-                    existing_fingerprint,
-                    frozen_jobs,
-                    preparation_only=preparation_only,
                 )
                 return existing
             raise LoopError(
@@ -5316,12 +6185,6 @@ def inspect_streaming_flow(
                     existing,
                     max_batch_videos=max_batch_videos,
                 )
-                _write_streaming_inspection_state(
-                    batch,
-                    existing_fingerprint,
-                    frozen_jobs,
-                    preparation_only=preparation_only,
-                )
                 return existing
             raise LoopError(
                 "批次使用未知或已退役的提示词管线且未完成可验证准备；"
@@ -5333,20 +6196,9 @@ def inspect_streaming_flow(
             raise LoopError(
                 "批次输入在 streaming job 产生后发生变化；请建立新批次，拒绝混用旧结果"
             )
-    bindings = validate_job_bindings(batch, index, reference_index)
-    validate_requirement_binding_contract(batch, bindings)
-    skipped = explicitly_skipped_ids(batch)
-    indexed_jobs = index["jobs"]  # type: ignore[index]
-    assert isinstance(indexed_jobs, list)
-    jobs = [
-        {
-            "id": str(job["id"]),
-            "filename": str(job["filename"]),
-            "skipped": str(job["id"]) in skipped,
-        }
-        for job in indexed_jobs
-        if isinstance(job, dict)
-    ]
+        if existing_fingerprint == fingerprint:
+            return existing
+    jobs = _expected_streaming_flow_jobs(batch, index)
     flow = {
         **identity,
         "flow_fingerprint": fingerprint,
@@ -5391,10 +6243,14 @@ def verify_streaming_flow(
         batch, project_root, index, reference_index
     )
     current_fingerprint = _streaming_flow_fingerprint(current_identity)
+    _validate_frozen_flow_jobs(batch, flow, index)
     binding_schema = _job_bindings_payload(batch).get("schema_version")
     if binding_schema in {1, 2}:
         if (
-            flow.get("flow_fingerprint") == current_fingerprint
+            (
+                flow.get("flow_fingerprint") == current_fingerprint
+                or _matches_pre_job_manifest_flow(flow, current_identity)
+            )
             and _retired_prompt_pipeline_flow_is_fully_prepared(
                 batch, flow, current_identity
             )
@@ -5446,12 +6302,6 @@ def preflight_streaming_submission(
     flow = verify_streaming_flow(
         batch, project_root, max_batch_videos=max_batch_videos
     )
-    _validate_frozen_flow_submission_plans(
-        batch,
-        project_root,
-        flow,
-        max_batch_videos=max_batch_videos,
-    )
     jobs = flow.get("jobs")
     assert isinstance(jobs, list)
     eligible = [
@@ -5459,6 +6309,44 @@ def preflight_streaming_submission(
         for item in jobs
         if isinstance(item, dict) and item.get("skipped") is not True
     ]
+    flow_fingerprint = str(flow["flow_fingerprint"])
+    failures: List[str] = []
+    for job_id in eligible:
+        preparation = _read_streaming_job_result(
+            batch, "preparation", job_id, flow_fingerprint
+        )
+        prepared_job = preparation["job"]
+        assert isinstance(prepared_job, dict)
+        status = str(prepared_job.get("status") or "")
+        if status != PREPARED_STATUS:
+            failures.append(
+                f"{job_id} 当前 preparation status 为 {status or 'UNKNOWN'}；"
+                "拒绝使用陈旧 submission plan"
+            )
+            continue
+        try:
+            load_submission_plan(
+                batch,
+                project_root,
+                job_id,
+                max_batch_videos=max_batch_videos,
+            )
+        except LoopError as exc:
+            _invalidate_prepared_streaming_job_result(
+                batch,
+                job_id,
+                flow_fingerprint,
+                preparation,
+                str(exc),
+            )
+            failures.append(f"{job_id} 提交计划复核失败：{exc}")
+    if failures:
+        # Keep the operator-facing state in sync before returning an error to
+        # JavaScript.  This remains local-only and creates no checkpoint.
+        finalize_streaming_preparation(
+            batch, project_root, max_batch_videos=max_batch_videos
+        )
+        raise LoopError("；".join(failures))
     return {
         "schema_version": 1,
         "batch_id": batch.name,
@@ -5492,6 +6380,54 @@ def _read_streaming_job_result(
     return value
 
 
+def _invalidate_prepared_streaming_job_result(
+    batch: Path,
+    job_id: str,
+    flow_fingerprint: str,
+    existing: Mapping[str, object],
+    reason: str,
+) -> Dict[str, object]:
+    """Atomically demote a stale READY artifact before any paid path runs."""
+
+    existing_job = existing.get("job")
+    if not isinstance(existing_job, dict):
+        raise LoopError(f"{job_id} preparation result 缺少 job")
+    invalidated = {
+        "schema_version": 1,
+        "batch_id": batch.name,
+        "job_id": job_id,
+        "flow_fingerprint": flow_fingerprint,
+        "updated_at": utc_now(),
+        # Preserve the prior READY record inside the new canonical result so
+        # retry history remains explainable even before retry-prepare archives
+        # this blocked attempt.
+        "invalidated_prepared_job": dict(existing_job),
+        "job": {
+            "id": job_id,
+            "status": "BLOCKED",
+            "task_id": None,
+            "output_path": None,
+            "blocker": f"提交计划复核失败：{reason}",
+        },
+    }
+    atomic_write_json(
+        _streaming_job_result_path(batch, "preparation", job_id), invalidated
+    )
+    atomic_write_json(
+        batch / "loop-state.json",
+        {
+            "batch_id": batch.name,
+            "state": "LOCAL_PREPARATION_BLOCKED",
+            "updated_at": utc_now(),
+            "flow_fingerprint": flow_fingerprint,
+            "invalidated_job": job_id,
+            "auto_ready": False,
+            "payment_approval_required": False,
+        },
+    )
+    return invalidated
+
+
 def prepare_streaming_job(
     batch: Path,
     loop_root: Path,
@@ -5500,6 +6436,7 @@ def prepare_streaming_job(
     *,
     executor: Optional[ExecutorSpec] = None,
     max_batch_videos: int = DEFAULT_MAX_BATCH_VIDEOS,
+    retry_existing: bool = False,
 ) -> Dict[str, object]:
     flow = verify_streaming_flow(
         batch, project_root, max_batch_videos=max_batch_videos
@@ -5517,20 +6454,29 @@ def prepare_streaming_job(
     if not isinstance(job_meta, dict):
         raise LoopError(f"{job_id} 不在 streaming flow 中")
     result_path = _streaming_job_result_path(batch, "preparation", job_id)
-    if result_path.is_file():
+    if result_path.is_file() and not retry_existing:
         existing = _read_streaming_job_result(
             batch, "preparation", job_id, flow_fingerprint
         )
         existing_job = existing["job"]
         assert isinstance(existing_job, dict)
         if existing_job.get("status") == PREPARED_STATUS:
-            load_submission_plan(
-                batch,
-                project_root,
-                job_id,
-                executor=executor,
-                max_batch_videos=max_batch_videos,
-            )
+            try:
+                load_submission_plan(
+                    batch,
+                    project_root,
+                    job_id,
+                    executor=executor,
+                    max_batch_videos=max_batch_videos,
+                )
+            except LoopError as exc:
+                return _invalidate_prepared_streaming_job_result(
+                    batch,
+                    job_id,
+                    flow_fingerprint,
+                    existing,
+                    str(exc),
+                )
         return existing
     if job_meta.get("skipped") is True:
         normalized_job = {
@@ -5646,6 +6592,109 @@ def prepare_streaming_job(
     }
     atomic_write_json(result_path, result)
     return result
+
+
+def retry_streaming_preparation_job(
+    batch: Path,
+    loop_root: Path,
+    project_root: Path,
+    job_id: str,
+    *,
+    executor: Optional[ExecutorSpec] = None,
+    max_batch_videos: int = DEFAULT_MAX_BATCH_VIDEOS,
+) -> Dict[str, object]:
+    """Archive and rerun exactly one failed local preparation attempt."""
+
+    if batch.parent.resolve() != (loop_root / "needs-input").resolve():
+        raise LoopError("retry-prepare 只接受 needs-input/ 中的批次")
+    if not (batch / "PAUSE").is_file():
+        raise LoopError("retry-prepare 要求批次存在 PAUSE")
+    flow = verify_streaming_flow(
+        batch, project_root, max_batch_videos=max_batch_videos
+    )
+    flow_fingerprint = str(flow["flow_fingerprint"])
+    jobs = flow.get("jobs")
+    job_meta = next(
+        (
+            item
+            for item in jobs
+            if isinstance(item, dict) and item.get("id") == job_id
+        ),
+        None,
+    ) if isinstance(jobs, list) else None
+    if not isinstance(job_meta, dict) or job_meta.get("skipped") is True:
+        raise LoopError(f"{job_id} 不是当前 flow 中可重试的 Job")
+    result_path = _streaming_job_result_path(batch, "preparation", job_id)
+    existing = _read_streaming_job_result(
+        batch, "preparation", job_id, flow_fingerprint
+    )
+    existing_job = existing["job"]
+    assert isinstance(existing_job, dict)
+    status = str(existing_job.get("status") or "")
+    if status == PREPARED_STATUS:
+        try:
+            load_submission_plan(
+                batch,
+                project_root,
+                job_id,
+                executor=executor,
+                max_batch_videos=max_batch_videos,
+            )
+        except LoopError:
+            pass
+        else:
+            raise LoopError(
+                f"{job_id} 当前 preparation status 为 {PREPARED_STATUS}，"
+                "且提交计划有效；拒绝重复准备"
+            )
+    elif status not in BLOCKED_STATUSES:
+        raise LoopError(
+            f"{job_id} 当前 preparation status 为 {status or 'UNKNOWN'}；"
+            "只允许重试 BLOCKED/FAILED，或提交计划已失效的 READY"
+        )
+    submission_result = (
+        batch / "streaming-results" / "submission" / f"{job_id}.json"
+    )
+    checkpoint_paths = [
+        batch / "payment-checkpoint.json",
+        batch / f"payment-checkpoint-{job_id}.json",
+    ]
+    if (
+        submission_result.is_file()
+        or any(path.is_file() for path in checkpoint_paths)
+        or recorded_task_id(project_root, batch.name, job_id)
+    ):
+        raise LoopError(
+            f"{job_id} 已存在提交、付费授权或远端任务证据；"
+            "拒绝把本地重试与付费恢复混用"
+        )
+    history_root = (
+        batch / "streaming-results" / "preparation-history" / job_id
+    )
+    history_root.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        history_root.chmod(0o700)
+    attempts = [
+        int(match.group(1))
+        for path in history_root.glob("attempt-*.json")
+        if (match := re.fullmatch(r"attempt-(\d+)\.json", path.name))
+    ]
+    history_path = history_root / f"attempt-{max(attempts, default=0) + 1:03d}.json"
+    atomic_write_json(history_path, existing)
+    chmod_private(history_path)
+    retried = prepare_streaming_job(
+        batch,
+        loop_root,
+        project_root,
+        job_id,
+        executor=executor,
+        max_batch_videos=max_batch_videos,
+        retry_existing=True,
+    )
+    if not isinstance(retried, dict):
+        raise LoopError(f"{job_id} retry preparation result 无效")
+    atomic_write_json(result_path, retried)
+    return retried
 
 
 def _payment_checkpoint_timestamp(value: object, label: str) -> datetime:
@@ -6080,9 +7129,25 @@ def finalize_streaming_preparation(
     status = "PARTIAL" if ready and blocked else (
         PREPARED_STATUS if ready else ("NO_ELIGIBLE_JOBS" if skipped == len(jobs) else "BLOCKED")
     )
+    workflow_state = (
+        "LOCAL_PREPARATION_BLOCKED"
+        if blocked
+        else (
+            "LOCAL_PREPARED_AWAITING_APPROVAL"
+            if ready
+            else (
+                "NO_ELIGIBLE_JOBS"
+                if skipped == len(jobs)
+                else "LOCAL_PREPARATION_BLOCKED"
+            )
+        )
+    )
+    payment_approval_required = bool(ready and not blocked)
     result = {
         "batch_status": status,
-        "summary": f"并行本地准备完成：可提交 {ready}，阻塞 {blocked}，跳过 {skipped}。",
+        "workflow_state": workflow_state,
+        "payment_approval_required": payment_approval_required,
+        "summary": f"FIFO 本地准备完成：可提交 {ready}，阻塞 {blocked}，跳过 {skipped}。",
         "jobs": jobs,
     }
     atomic_write_json(batch / "local-preparation-result.json", result)
@@ -6090,14 +7155,14 @@ def finalize_streaming_preparation(
         batch / "loop-state.json",
         {
             "batch_id": batch.name,
-            "state": "LOCAL_PREPARED_AWAITING_APPROVAL",
+            "state": workflow_state,
             "updated_at": utc_now(),
             "flow_fingerprint": flow["flow_fingerprint"],
             "prepared_jobs": ready,
             "blocked_jobs": blocked,
             "skipped_jobs": skipped,
             "auto_ready": False,
-            "payment_approval_required": True,
+            "payment_approval_required": payment_approval_required,
         },
     )
     return result
@@ -6962,6 +8027,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     prepare_job.add_argument("batch")
     prepare_job.add_argument("job_id")
+    retry_prepare_job = commands.add_parser(
+        "retry-prepare-job",
+        help="事务式归档并重跑一个失败或提交计划失效的本地准备 Job",
+    )
+    retry_prepare_job.add_argument("batch")
+    retry_prepare_job.add_argument("job_id")
     submit_job = commands.add_parser(
         "submit-job", help="提交或恢复一个已准备的 V 编号"
     )
@@ -7022,9 +8093,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             errors, coverage = validate_requirements(batch)
             if not errors:
                 try:
-                    index, reference_index = verify_batch_integrity(
+                    index = verify_batch_index(
                         batch, max_batch_videos=args.max_batch_videos
                     )
+                    reference_index = reference_index_for_validation(
+                        batch, persist_if_unfrozen=False
+                    )
+                    binding_payload = _job_bindings_payload(batch)
+                    if (
+                        binding_payload.get("schema_version") != 3
+                        and not _has_frozen_legacy_flow(batch)
+                    ):
+                        raise LoopError(
+                            f"新批次的 {JOB_BINDINGS_FILENAME} 必须使用 schema_version 3"
+                        )
                     bindings = validate_job_bindings(
                         batch, index, reference_index
                     )
@@ -7075,6 +8157,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.job_id,
                 max_batch_videos=args.max_batch_videos,
             )
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
+        if args.command == "retry-prepare-job":
+            with exclusive_loop_lock(loop_root):
+                result = retry_streaming_preparation_job(
+                    locate_batch(loop_root, args.batch),
+                    loop_root,
+                    project_root,
+                    args.job_id,
+                    max_batch_videos=args.max_batch_videos,
+                )
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return 0
         if args.command == "submit-job":

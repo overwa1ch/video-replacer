@@ -99,7 +99,7 @@ class OperatorIntakeTest(unittest.TestCase):
             loop.select_job_reference_records(batch, "V001")
 
     def test_new_schema_v2_batch_is_rejected_before_preparation(self) -> None:
-        batch = self.make_batch("替换车内饰", schema_version=2)
+        batch = self.make_batch("使用@图片1替换车内饰", schema_version=2)
         with self.assertRaisesRegex(loop.LoopError, "schema_version 3"):
             loop.inspect_streaming_flow(
                 batch,
@@ -109,7 +109,10 @@ class OperatorIntakeTest(unittest.TestCase):
             )
 
     def test_unfinished_schema_v2_flow_is_rejected_before_new_prompt_pipeline(self) -> None:
-        batch = self.make_batch("替换车内饰", schema_version=2)
+        batch = self.make_batch("使用@图片1替换车内饰", schema_version=2)
+        loop.atomic_write_json(
+            batch / "reference-index.json", loop.build_reference_index(batch)
+        )
         loop.atomic_write_json(
             batch / "streaming-flow.json",
             {
@@ -119,7 +122,9 @@ class OperatorIntakeTest(unittest.TestCase):
                 "flow_fingerprint": "b" * 64,
             },
         )
-        with self.assertRaisesRegex(loop.LoopError, "拒绝混用提示词管线"):
+        with self.assertRaisesRegex(
+            loop.LoopError, "(冻结 Job 清单|拒绝混用提示词管线)"
+        ):
             loop.inspect_streaming_flow(
                 batch,
                 self.loop_root,

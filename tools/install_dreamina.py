@@ -76,6 +76,25 @@ def read_manifest(path: Path = MANIFEST_PATH) -> Dict[str, object]:
 def platform_key(system: Optional[str] = None, machine: Optional[str] = None) -> str:
     system_name = (system or platform.system()).casefold()
     machine_name = (machine or platform.machine()).casefold()
+    # Python running under Rosetta reports x86_64 even when the native macOS
+    # host is arm64. Select the provider binary for the actual host in that
+    # case; otherwise a valid arm64 installation is incorrectly rejected.
+    if machine is None and system_name == "darwin" and machine_name in {"x86_64", "amd64"}:
+        try:
+            translated = subprocess.check_output(
+                ["/usr/sbin/sysctl", "-n", "sysctl.proc_translated"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            arm64_host = subprocess.check_output(
+                ["/usr/sbin/sysctl", "-n", "hw.optional.arm64"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            if translated == "1" and arm64_host == "1":
+                machine_name = "arm64"
+        except (OSError, subprocess.SubprocessError):
+            pass
     systems = {"darwin": "darwin", "linux": "linux", "windows": "windows"}
     machines = {
         "x86_64": "amd64",

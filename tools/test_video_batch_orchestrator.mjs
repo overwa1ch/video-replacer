@@ -12,13 +12,16 @@ import {
   STATE_NAMES,
   buildEngineArgs,
   main,
+  readBatchStatus,
   readLoopSummary,
   paymentAuthorizationBinding,
   resolveOptions,
   runEngine,
   runJobPipeline,
+  runPreparationQueue,
   runPreparedStreamingBatch,
   runWatch,
+  usage,
 } from "./video_batch_orchestrator.mjs";
 
 const TEST_REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -206,6 +209,100 @@ test("status reports batch folders without invoking the worker", async () => {
   assert.equal(summary.orchestrator, null);
 });
 
+test("batch status distinguishes local preparation from paid approval", async () => {
+  const paths = await fixture();
+  const batch = join(paths.loopRoot, "needs-input", "batch-status");
+  await mkdir(join(batch, "streaming-results", "preparation"), { recursive: true });
+  await writeFile(
+    join(batch, "loop-state.json"),
+    JSON.stringify({
+      state: "LOCAL_PREPARED_AWAITING_APPROVAL",
+      payment_approval_required: true,
+    }),
+    "utf8",
+  );
+  await writeFile(
+    join(batch, "streaming-flow.json"),
+    JSON.stringify({
+      flow_fingerprint: "a".repeat(64),
+      jobs: [{ id: "V001", skipped: false }],
+    }),
+    "utf8",
+  );
+  await writeFile(
+    join(batch, "streaming-results", "preparation", "V001.json"),
+    JSON.stringify({ job: { id: "V001", status: "READY_FOR_SUBMISSION" } }),
+    "utf8",
+  );
+  await writeFile(
+    join(batch, "streaming-results", "preparation-schedule.json"),
+    JSON.stringify({
+      policy: "STRICT_FIFO",
+      jobs: [{ id: "V001", phase: "WORKER_RUNNING" }],
+    }),
+    "utf8",
+  );
+  const processRoot = join(
+    batch,
+    "streaming-results",
+    "agents",
+    "V001-video-to-prompt",
+    "20260817-120000-000000-100-one",
+  );
+  await mkdir(processRoot, { recursive: true });
+  await writeFile(
+    join(processRoot, "codex-process.json"),
+    JSON.stringify({
+      phase: "EXECUTING",
+      stage: "video-to-prompt",
+      job_ids: ["V001"],
+      queued_at: "2026-08-17T04:00:00.000Z",
+      lock_acquired_at: "2026-08-17T04:00:01.000Z",
+      exec_started_at: "2026-08-17T04:00:01.100Z",
+      auth_lock_wait_seconds: 1,
+    }),
+    "utf8",
+  );
+
+  const status = await readBatchStatus(batch);
+  assert.equal(status.state, "LOCAL_PREPARED_AWAITING_APPROVAL");
+  assert.equal(status.payment_approval_required, true);
+  assert.equal(status.preparation[0].preparation_status, "READY_FOR_SUBMISSION");
+  assert.equal(status.schedules.preparation.jobs[0].phase, "WORKER_RUNNING");
+  assert.equal(status.schedules.submission_revalidation, null);
+  assert.equal(status.latest_node_process.phase, "EXECUTING");
+  assert.equal(status.latest_node_process.auth_lock_wait_seconds, 1);
+});
+
+test("batch status fails closed when canonical preparation contradicts paid-ready state", async () => {
+  const paths = await fixture();
+  const batch = join(paths.loopRoot, "needs-input", "batch-status-stale");
+  await mkdir(join(batch, "streaming-results", "preparation"), { recursive: true });
+  await writeFile(
+    join(batch, "loop-state.json"),
+    JSON.stringify({
+      state: "LOCAL_PREPARED_AWAITING_APPROVAL",
+      payment_approval_required: true,
+    }),
+    "utf8",
+  );
+  await writeFile(
+    join(batch, "streaming-flow.json"),
+    JSON.stringify({ jobs: [{ id: "V001", skipped: false }] }),
+    "utf8",
+  );
+  await writeFile(
+    join(batch, "streaming-results", "preparation", "V001.json"),
+    JSON.stringify({ job: { id: "V001", status: "BLOCKED", blocker: "plan stale" } }),
+    "utf8",
+  );
+
+  const status = await readBatchStatus(batch);
+  assert.equal(status.state, "LOCAL_PREPARATION_BLOCKED");
+  assert.equal(status.payment_approval_required, false);
+  assert.equal(status.preparation[0].preparation_status, "BLOCKED");
+});
+
 test("JavaScript watch owns cycles and persists a health snapshot", async () => {
   const paths = await fixture();
   const options = await optionsFor(paths, [
@@ -266,6 +363,105 @@ test("streaming pipeline enforces separate preparation and generation pools", as
   assert.ok(preparedWhenFirstGenerationStarted < jobs.length);
 });
 
+test("preparation defaults to one FIFO worker and rejects misleading concurrency", async () => {
+  const paths = await fixture();
+  const options = await optionsFor(paths, ["prepare", "batch-a"]);
+  assert.equal(options.preparationConcurrency, 1);
+  await assert.rejects(
+    optionsFor(paths, ["--preparation-concurrency", "2", "prepare", "batch-a"]),
+    (error) =>
+      error instanceof OrchestratorError && /preparation-concurrency.*1/.test(error.message),
+  );
+
+  for (const command of [["status"], ["help"], ["check", "batch-a"]]) {
+    const legacyEnvironment = await resolveOptions(command, {
+      VIDEO_LOOP_PREPARATION_CONCURRENCY: "3",
+    });
+    assert.equal(legacyEnvironment.preparationConcurrency, 1);
+    assert.equal(legacyEnvironment.requestedPreparationConcurrency, 3);
+  }
+  const legacyPrepare = await resolveOptions(["prepare", "batch-a"], {
+    VIDEO_LOOP_PREPARATION_CONCURRENCY: "3",
+  });
+  assert.equal(legacyPrepare.preparationConcurrency, 1);
+
+  const legacyConfigPath = join(paths.root, "legacy-config.json");
+  await writeFile(
+    legacyConfigPath,
+    JSON.stringify({ schema_version: 1, concurrency: { preparation: 3 } }),
+    "utf8",
+  );
+  const legacyConfig = await resolveOptions(
+    ["--config", legacyConfigPath, "status"],
+    {},
+  );
+  assert.equal(legacyConfig.preparationConcurrency, 1);
+  assert.equal(legacyConfig.requestedPreparationConcurrency, 3);
+});
+
+test("preparation queue is strict FIFO and persists phase timings", async () => {
+  const paths = await fixture();
+  const batch = join(paths.loopRoot, "needs-input", "batch-fifo");
+  await mkdir(batch, { recursive: true });
+  const events = [];
+  let active = 0;
+  let maxActive = 0;
+  const jobs = ["V001", "V002", "V003"].map((id) => ({ id }));
+
+  const realDateNow = Date.now;
+  let fakeWallClock = 10_000;
+  Date.now = () => {
+    fakeWallClock -= 1_000;
+    return fakeWallClock;
+  };
+  let results;
+  try {
+    results = await runPreparationQueue(jobs, {
+      batch,
+      prepareJob: async (job) => {
+        events.push(`start:${job.id}`);
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 3));
+        active -= 1;
+        events.push(`end:${job.id}`);
+        return { job: { id: job.id, status: "READY_FOR_SUBMISSION" } };
+      },
+    });
+  } finally {
+    Date.now = realDateNow;
+  }
+
+  assert.equal(results.length, 3);
+  assert.equal(maxActive, 1);
+  assert.deepEqual(events, [
+    "start:V001", "end:V001",
+    "start:V002", "end:V002",
+    "start:V003", "end:V003",
+  ]);
+  const schedule = JSON.parse(
+    await readFile(
+      join(batch, "streaming-results", "preparation-schedule.json"),
+      "utf8",
+    ),
+  );
+  assert.equal(schedule.policy, "STRICT_FIFO");
+  assert.deepEqual(schedule.jobs.map((job) => job.id), ["V001", "V002", "V003"]);
+  assert.equal(schedule.jobs.every((job) => job.phase === "FINISHED"), true);
+  assert.equal(schedule.jobs.every((job) => Number.isFinite(job.queue_wait_seconds)), true);
+  assert.equal(schedule.jobs.every((job) => Number.isFinite(job.worker_seconds)), true);
+  assert.equal(schedule.jobs.every((job) => job.queue_wait_seconds >= 0), true);
+  assert.equal(schedule.jobs.every((job) => job.worker_seconds >= 0), true);
+});
+
+test("help describes a zero-write model node without staged ffmpeg", () => {
+  const text = usage();
+  assert.match(text, /workspace 为零写入/);
+  assert.match(text, /父进程先用可信 ffmpeg/);
+  assert.doesNotMatch(text, /scratch\+delivery/);
+  assert.doesNotMatch(text, /ffmpeg 已 hardlink\/copy/);
+});
+
 test("prepare executes local preparation nodes and never reaches submission", async () => {
   const paths = await fixture();
   const batch = join(paths.loopRoot, "needs-input", "batch-local-only");
@@ -309,21 +505,72 @@ test("prepare executes local preparation nodes and never reaches submission", as
   );
 });
 
-test("submit-prepared stays on the streaming generation path", async () => {
+test("retry-prepare reruns only one local blocked job and never reaches paid commands", async () => {
   const paths = await fixture();
-  const batch = join(paths.loopRoot, "needs-input", "batch-prepared");
+  const batch = join(paths.loopRoot, "needs-input", "batch-retry-local");
+  const commandLog = join(paths.root, "retry-local-commands.log");
   await mkdir(batch, { recursive: true });
   await writeFile(
     paths.engine,
     [
+      "import { appendFileSync } from 'node:fs';",
       "const args = process.argv.slice(2);",
-      "const known = ['cleanup-node-runs', 'inspect-flow', 'prepare-job', 'preflight-submission', 'submit-job', 'finalize-flow'];",
+      "const known = ['cleanup-node-runs', 'inspect-flow', 'retry-prepare-job', 'finalize-preparation-flow', 'preflight-submission', 'submit-job'];",
+      "const command = args.find((value) => known.includes(value));",
+      "const index = args.indexOf(command);",
+      "const jobId = command === 'retry-prepare-job' ? args[index + 2] : '';",
+      `appendFileSync(${JSON.stringify(commandLog)}, command + (jobId ? ':' + jobId : '') + '\\n');`,
+      "if (command === 'cleanup-node-runs') console.log(JSON.stringify({removed_count:0,removed:[]}));",
+      "else if (command === 'inspect-flow') console.log(JSON.stringify({flow_fingerprint:'flow-local',jobs:[{id:'V001'},{id:'V002'}]}));",
+      "else if (command === 'retry-prepare-job') console.log(JSON.stringify({job:{id:jobId,status:'READY_FOR_SUBMISSION'}}));",
+      "else if (command === 'finalize-preparation-flow') console.log(JSON.stringify({batch_status:'LOCAL_PREPARED_AWAITING_APPROVAL'}));",
+      "else process.exit(9);",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const exitCode = await main([
+    "--project-root", paths.projectRoot,
+    "--root", paths.loopRoot,
+    "--python", process.execPath,
+    "--engine", paths.engine,
+    "retry-prepare", batch, "V002",
+  ]);
+  assert.equal(exitCode, 0);
+  assert.deepEqual(
+    (await readFile(commandLog, "utf8")).trim().split("\n"),
+    [
+      "cleanup-node-runs",
+      "retry-prepare-job:V002",
+      "finalize-preparation-flow",
+    ],
+  );
+});
+
+test("submit-prepared stays on the streaming generation path", async () => {
+  const paths = await fixture();
+  const batch = join(paths.loopRoot, "needs-input", "batch-prepared");
+  await mkdir(batch, { recursive: true });
+  const originalPreparationSchedule = '{"original":"preparation evidence"}\n';
+  await mkdir(join(batch, "streaming-results"), { recursive: true });
+  await writeFile(
+    join(batch, "streaming-results", "preparation-schedule.json"),
+    originalPreparationSchedule,
+    "utf8",
+  );
+  await writeFile(
+    paths.engine,
+    [
+      "const args = process.argv.slice(2);",
+      "const known = ['cleanup-node-runs', 'inspect-flow', 'prepare-job', 'finalize-preparation-flow', 'preflight-submission', 'submit-job', 'finalize-flow'];",
       "const command = args.find((value) => known.includes(value));",
       "const index = args.indexOf(command);",
       "const jobId = command === 'prepare-job' || command === 'submit-job' ? args[index + 2] : null;",
       "if (command === 'cleanup-node-runs') console.log(JSON.stringify({removed_count:0,removed:[]}));",
       "else if (command === 'inspect-flow') console.log(JSON.stringify({flow_fingerprint:'flow-a', jobs:[{id:'V001'},{id:'V002'}]}));",
       "else if (command === 'prepare-job') console.log(JSON.stringify({job:{id:jobId,status:'READY_FOR_SUBMISSION'}}));",
+      "else if (command === 'finalize-preparation-flow') console.log(JSON.stringify({workflow_state:'LOCAL_PREPARED_AWAITING_APPROVAL'}));",
       "else if (command === 'preflight-submission') console.log(JSON.stringify({ready_for_paid_submission:true}));",
       "else if (command === 'submit-job') { if (!/^[0-9a-f]{64}$/.test(process.env.VIDEO_LOOP_PAYMENT_AUTH_TOKEN || '')) process.exit(4); console.log(JSON.stringify({job:{id:jobId,status:'COMPLETED'}})); }",
       "else if (command === 'finalize-flow') console.log(JSON.stringify({destination:'completed/batch-prepared'}));",
@@ -357,6 +604,24 @@ test("submit-prepared stays on the streaming generation path", async () => {
     paymentAuthorizationBinding(options.paymentAuthorizationToken, checkpoint),
   );
   assert.equal(JSON.stringify(checkpoint).includes(options.paymentAuthorizationToken), false);
+  assert.equal(
+    await readFile(
+      join(batch, "streaming-results", "preparation-schedule.json"),
+      "utf8",
+    ),
+    originalPreparationSchedule,
+  );
+  const revalidationSchedule = JSON.parse(
+    await readFile(
+      join(batch, "streaming-results", "submission-revalidation-schedule.json"),
+      "utf8",
+    ),
+  );
+  assert.equal(revalidationSchedule.policy, "STRICT_FIFO");
+  assert.deepEqual(
+    revalidationSchedule.jobs.map((job) => job.id),
+    ["V001", "V002"],
+  );
 });
 
 test("submit-prepared preflights the whole prepared batch before any paid checkpoint", async () => {
@@ -369,12 +634,13 @@ test("submit-prepared preflights the whole prepared batch before any paid checkp
     [
       "import { appendFileSync } from 'node:fs';",
       "const args = process.argv.slice(2);",
-      "const known = ['inspect-flow', 'prepare-job', 'preflight-submission', 'submit-job', 'finalize-flow'];",
+      "const known = ['inspect-flow', 'prepare-job', 'finalize-preparation-flow', 'preflight-submission', 'submit-job', 'finalize-flow'];",
       "const command = args.find((value) => known.includes(value));",
       "const index = args.indexOf(command);",
       "const jobId = command === 'prepare-job' || command === 'submit-job' ? args[index + 2] : null;",
       "if (command === 'inspect-flow') console.log(JSON.stringify({flow_fingerprint:'flow-preflight',jobs:[{id:'V001'},{id:'V002'},{id:'V003'}]}));",
       `else if (command === 'prepare-job') { appendFileSync(${JSON.stringify(eventLog)}, 'prepare-done:' + jobId + '\\n'); console.log(JSON.stringify({job:{id:jobId,status:'READY_FOR_SUBMISSION'}})); }`,
+      `else if (command === 'finalize-preparation-flow') { appendFileSync(${JSON.stringify(eventLog)}, 'finalize-preparation-flow\\n'); console.log(JSON.stringify({workflow_state:'LOCAL_PREPARED_AWAITING_APPROVAL'})); }`,
       `else if (command === 'preflight-submission') { appendFileSync(${JSON.stringify(eventLog)}, 'preflight-submission\\n'); process.stderr.write('invalid submission plan\\n'); process.exit(9); }`,
       `else if (command === 'submit-job') { appendFileSync(${JSON.stringify(eventLog)}, 'submit-job:' + jobId + '\\n'); console.log(JSON.stringify({job:{id:jobId,status:'COMPLETED'}})); }`,
       `else if (command === 'finalize-flow') { appendFileSync(${JSON.stringify(eventLog)}, 'finalize-flow\\n'); console.log(JSON.stringify({destination:'completed/batch-preflight-blocked'})); }`,
@@ -407,6 +673,10 @@ test("submit-prepared preflights the whole prepared batch before any paid checkp
     preparationEvents.every(
       (event) => events.indexOf(event) < events.indexOf("preflight-submission"),
     ),
+  );
+  assert.ok(
+    events.indexOf("finalize-preparation-flow") <
+      events.indexOf("preflight-submission"),
   );
   assert.equal(events.some((event) => event.startsWith("submit-job:")), false);
   assert.equal(events.includes("finalize-flow"), false);
@@ -533,13 +803,14 @@ test("profile-managed submission approval binds each job's final local media", a
     paths.engine,
     [
       "const args = process.argv.slice(2);",
-      "const known = ['cleanup-node-runs', 'inspect-flow', 'prepare-job', 'preflight-submission', 'submit-job', 'finalize-flow'];",
+      "const known = ['cleanup-node-runs', 'inspect-flow', 'prepare-job', 'finalize-preparation-flow', 'preflight-submission', 'submit-job', 'finalize-flow'];",
       "const command = args.find((value) => known.includes(value));",
       "const index = args.indexOf(command);",
       "const jobId = command === 'prepare-job' || command === 'submit-job' ? args[index + 2] : null;",
       "if (command === 'cleanup-node-runs') console.log(JSON.stringify({removed_count:0,removed:[]}));",
       "else if (command === 'inspect-flow') console.log(JSON.stringify({flow_fingerprint:'profile-flow',jobs:[{id:'V001'},{id:'V002'}]}));",
       "else if (command === 'prepare-job') console.log(JSON.stringify({job:{id:jobId,status:'READY_FOR_SUBMISSION'}}));",
+      "else if (command === 'finalize-preparation-flow') console.log(JSON.stringify({workflow_state:'LOCAL_PREPARED_AWAITING_APPROVAL'}));",
       "else if (command === 'preflight-submission') console.log(JSON.stringify({ready_for_paid_submission:true}));",
       "else if (command === 'submit-job') console.log(JSON.stringify({job:{id:jobId,status:'COMPLETED'}}));",
       "else if (command === 'finalize-flow') console.log(JSON.stringify({destination:'completed/batch-profile-prepared'}));",

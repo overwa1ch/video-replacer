@@ -16,7 +16,7 @@
     "max_consecutive_failures": 5
   },
   "concurrency": {
-    "preparation": 3,
+    "preparation": 1,
     "generation": 2
   }
 }
